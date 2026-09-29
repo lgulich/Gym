@@ -99,6 +99,7 @@ def prepare_target(
     refresh_registry: bool = False,
     force: bool = False,
     exclude: list[str] | None = None,
+    only: list[str] | None = None,
 ) -> PreparedTaskset:
     """Fetch (for hub references) and load the tasks, then write the rows file.
 
@@ -128,7 +129,7 @@ def prepare_target(
         )
     for task_id, error in errors.items():
         logger.warning("Skipping task %s: %s", task_id, error)
-    tasks, skipped = select_tasks(tasks, exclude or [])
+    tasks, skipped = select_tasks(tasks, exclude or [], only)
     for task_id, reason in skipped:
         print(f"Skipping {task_id}: {reason}")
     if not tasks:
@@ -153,13 +154,17 @@ def runs_in_sandbox(impl_name: str, impl_config: Any) -> bool:
     return declares_sandbox_url or impl_name in IN_SANDBOX_AGENTS
 
 
-def select_tasks(tasks: list[HarborTask], exclude: list[str]) -> tuple[list[HarborTask], list[tuple[str, str]]]:
+def select_tasks(
+    tasks: list[HarborTask], exclude: list[str], only: list[str] | None = None
+) -> tuple[list[HarborTask], list[tuple[str, str]]]:
     """Split tasks into the ones to run and ``(task_id, reason)`` pairs left out."""
     kept: list[HarborTask] = []
     skipped: list[tuple[str, str]] = []
     for task in tasks:
         pattern = next((p for p in exclude if fnmatch.fnmatchcase(task.task_id, p)), None)
-        if pattern is not None:
+        if only and not any(fnmatch.fnmatchcase(task.task_id, p) for p in only):
+            skipped.append((task.task_id, "not in --only-tasks"))
+        elif pattern is not None:
             skipped.append((task.task_id, f"excluded by --exclude-tasks {pattern!r}"))
         elif task.needs_compose:
             skipped.append((task.task_id, "Compose environments are not supported yet"))
@@ -168,8 +173,8 @@ def select_tasks(tasks: list[HarborTask], exclude: list[str]) -> tuple[list[Harb
     return kept, skipped
 
 
-def _excluded(args: argparse.Namespace) -> list[str]:
-    raw = getattr(args, "exclude_tasks", None) or ""
+def _patterns(args: argparse.Namespace, name: str) -> list[str]:
+    raw = getattr(args, name, None) or ""
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
@@ -300,7 +305,12 @@ def run_target(args: argparse.Namespace, overrides: list[str]) -> None:
     except (ValueError, OSError, yaml.YAMLError) as exc:
         args._parser.error(str(exc))
     try:
-        prepared = prepare_target(args.target, exclude=_excluded(args), force=getattr(args, "force", False))
+        prepared = prepare_target(
+            args.target,
+            exclude=_patterns(args, "exclude_tasks"),
+            only=_patterns(args, "only_tasks"),
+            force=getattr(args, "force", False),
+        )
     except (HarborTaskError, HubError, ValueError, OSError) as exc:
         args._parser.error(str(exc))
     if prepared.skipped and not getattr(args, "skip_unloadable", False):
@@ -335,7 +345,8 @@ def validate_target(args: argparse.Namespace, overrides: list[str]) -> None:
         prepared = prepare_target(
             args.target,
             output_root=DEFAULT_OUTPUT_ROOT / "validation",
-            exclude=_excluded(args),
+            exclude=_patterns(args, "exclude_tasks"),
+            only=_patterns(args, "only_tasks"),
             force=getattr(args, "force", False),
         )
     except (HarborTaskError, HubError, ValueError, OSError, yaml.YAMLError) as exc:
