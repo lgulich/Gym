@@ -14,6 +14,7 @@ selected agent, environment server and model configs.
 """
 
 import argparse
+import fnmatch
 import json
 import logging
 import math
@@ -97,12 +98,17 @@ def prepare_target(
     output_root: Path = DEFAULT_OUTPUT_ROOT,
     refresh_registry: bool = False,
     force: bool = False,
+    exclude: list[str] | None = None,
 ) -> PreparedTaskset:
     """Fetch (for hub references) and load the tasks, then write the rows file.
 
     A task folder that does not load is skipped with a warning (and listed in
     ``PreparedTaskset.skipped``) so the rest of the dataset still prepares. ``force``
     lets a fetch replace task folders whose content differs from the Harbor store.
+    ``PreparedTaskset.skipped``) so the rest of the dataset still prepares.
+
+    Tasks matching an ``exclude`` glob, and Compose tasks (which the harbor server cannot
+    run yet), are left out of the rows and listed on stdout.
     """
     if is_hub_ref(target):
         folder = fetch_ref(target, refresh_registry=refresh_registry, force=force)
@@ -122,6 +128,11 @@ def prepare_target(
         )
     for task_id, error in errors.items():
         logger.warning("Skipping task %s: %s", task_id, error)
+    tasks, skipped = select_tasks(tasks, exclude or [])
+    for task_id, reason in skipped:
+        print(f"Skipping {task_id}: {reason}")
+    if not tasks:
+        raise ValueError(f"No runnable task left in {folder}")
     rows_path = output_dir / "tasks.jsonl"
     write_rows(tasks, taskset, rows_path)
     skipped_note = f", skipped {len(errors)}" if errors else ""
@@ -140,6 +151,26 @@ def runs_in_sandbox(impl_name: str, impl_config: Any) -> bool:
     """Whether the harness behind ``impl_name`` calls the model server from inside the task sandbox."""
     declares_sandbox_url = isinstance(impl_config, dict) and SANDBOX_MODEL_BASE_URL_KEY in impl_config
     return declares_sandbox_url or impl_name in IN_SANDBOX_AGENTS
+
+
+def select_tasks(tasks: list[HarborTask], exclude: list[str]) -> tuple[list[HarborTask], list[tuple[str, str]]]:
+    """Split tasks into the ones to run and ``(task_id, reason)`` pairs left out."""
+    kept: list[HarborTask] = []
+    skipped: list[tuple[str, str]] = []
+    for task in tasks:
+        pattern = next((p for p in exclude if fnmatch.fnmatchcase(task.task_id, p)), None)
+        if pattern is not None:
+            skipped.append((task.task_id, f"excluded by --exclude-tasks {pattern!r}"))
+        elif task.needs_compose:
+            skipped.append((task.task_id, "Compose environments are not supported yet"))
+        else:
+            kept.append(task)
+    return kept, skipped
+
+
+def _excluded(args: argparse.Namespace) -> list[str]:
+    raw = getattr(args, "exclude_tasks", None) or ""
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 def resolve_agent(agent: str) -> AgentSelection:
@@ -268,8 +299,8 @@ def run_target(args: argparse.Namespace, overrides: list[str]) -> None:
     except (ValueError, OSError, yaml.YAMLError) as exc:
         args._parser.error(str(exc))
     try:
-        prepared = prepare_target(args.target, force=getattr(args, "force", False))
-    except (HarborTaskError, HubError, OSError) as exc:
+        prepared = prepare_target(args.target, exclude=_excluded(args), force=getattr(args, "force", False))
+    except (HarborTaskError, HubError, ValueError, OSError) as exc:
         args._parser.error(str(exc))
     if prepared.skipped and not getattr(args, "skip_unloadable", False):
         args._parser.error(
@@ -301,7 +332,10 @@ def validate_target(args: argparse.Namespace, overrides: list[str]) -> None:
         if sandbox is not None:
             resolve_sandbox_config(sandbox)
         prepared = prepare_target(
-            args.target, output_root=DEFAULT_OUTPUT_ROOT / "validation", force=getattr(args, "force", False)
+            args.target,
+            output_root=DEFAULT_OUTPUT_ROOT / "validation",
+            exclude=_excluded(args),
+            force=getattr(args, "force", False),
         )
     except (HarborTaskError, HubError, ValueError, OSError, yaml.YAMLError) as exc:
         args._parser.error(str(exc))
