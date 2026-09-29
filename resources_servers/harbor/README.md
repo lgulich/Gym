@@ -102,3 +102,9 @@ gym eval run resources_servers/harbor/data/tasks --agent hermes_agent --sandbox 
 
 The loader generates the task mapping and dataset rows for that run. Keep `verified: false` until
 the benchmark has been profiled and reviewed with its intended harness and model.
+
+`harbor:<dataset>[@<version>]` resolves the Harbor registry and fetches the task folders into Gym's shared
+datasets folder (`$NEMO_GYM_DATASETS_DIR`, default `./datasets`). `harbor:<org>/<name>[@<tag> | @sha256:<digest>]`
+fetches a package-store dataset instead (for example `harbor:terminal-bench/terminal-bench@4.0.0`): every task
+package is downloaded by content hash into `<name>-<tag>/`, checked against Gym's task digest and recorded in
+`manifest.toml`. A local task folder, or a folder of task folders, works the same way.
