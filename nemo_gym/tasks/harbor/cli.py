@@ -7,7 +7,7 @@ Preparation writes, under ``results/harbor/<taskset>/``:
 
 - ``tasks.jsonl``: one materialized row per loadable task;
 - ``skipped.json``: omitted task IDs and reasons (empty when all tasks load);
-- ``run_config.yaml``: the resources server, agent and environment server blocks.
+- ``run_config_<agent>.yaml``: the resources server, agent and environment server blocks.
 
 Then the ordinary end-to-end rollout collection runs with that config plus the
 selected agent, environment server and model configs.
@@ -262,7 +262,8 @@ def build_run(
     config["output_jsonl_fpath"] = str(prepared.output_dir / "rollouts.jsonl")
     if agent.runs_in_sandbox:
         config[USE_ABSOLUTE_IP_KEY] = True
-    config_path = prepared.output_dir / "run_config.yaml"
+    # One file per agent, so a validate and an eval run on the same taskset do not overwrite each other.
+    config_path = prepared.output_dir / f"run_config_{agent.instance_name}.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
 
     config_paths = [
