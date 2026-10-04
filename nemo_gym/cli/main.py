@@ -686,6 +686,17 @@ SANDBOX = Flag(
     ),
 )
 
+# `--force`: let a `harbor:` fetch replace task folders whose content differs from the store.
+# Register-only: consumed by the Harbor prepare step, not translated to a Hydra override.
+FORCE_REFETCH = Flag(
+    register=lambda p: p.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace fetched Harbor task folders whose content differs from the store, discarding local edits. "
+        "Used with a `harbor:` TARGET.",
+    ),
+)
+
 
 def _eval_health_check(args: argparse.Namespace, overrides: list[str]) -> None:
     expected_overrides = ["+verbose=true"] if args.verbose else []
@@ -912,6 +923,7 @@ COMMANDS = {
                 )
             ),
             SANDBOX,
+            FORCE_REFETCH,
             CONFIG,
             MODEL_TYPE,
             SEARCH_DIR,
@@ -1090,6 +1102,7 @@ COMMANDS = {
                     help="Run the loadable subset of a Harbor TARGET; record omitted tasks in skipped.json.",
                 )
             ),
+            FORCE_REFETCH,
             CONFIG,
             BENCHMARK,
             ENVIRONMENT,

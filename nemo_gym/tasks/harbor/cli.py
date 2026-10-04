@@ -95,14 +95,16 @@ def prepare_target(
     *,
     output_root: Path = DEFAULT_OUTPUT_ROOT,
     refresh_registry: bool = False,
+    force: bool = False,
 ) -> PreparedTaskset:
     """Fetch (for hub references) and load the tasks, then write the rows file.
 
     A task folder that does not load is skipped with a warning (and listed in
-    ``PreparedTaskset.skipped``) so the rest of the dataset still prepares.
+    ``PreparedTaskset.skipped``) so the rest of the dataset still prepares. ``force``
+    lets a fetch replace task folders whose content differs from the Harbor store.
     """
     if is_hub_ref(target):
-        folder = fetch_ref(target, refresh_registry=refresh_registry)
+        folder = fetch_ref(target, refresh_registry=refresh_registry, force=force)
         print(f"Fetched {target} into {folder}")
     else:
         folder = Path(target).expanduser().resolve()
@@ -265,7 +267,7 @@ def run_target(args: argparse.Namespace, overrides: list[str]) -> None:
     except (ValueError, OSError, yaml.YAMLError) as exc:
         args._parser.error(str(exc))
     try:
-        prepared = prepare_target(args.target)
+        prepared = prepare_target(args.target, force=getattr(args, "force", False))
     except (HarborTaskError, HubError, OSError) as exc:
         args._parser.error(str(exc))
     if prepared.skipped and not getattr(args, "skip_unloadable", False):
@@ -297,7 +299,9 @@ def validate_target(args: argparse.Namespace, overrides: list[str]) -> None:
         sandbox = getattr(args, "sandbox", None)
         if sandbox is not None:
             resolve_sandbox_config(sandbox)
-        prepared = prepare_target(args.target, output_root=DEFAULT_OUTPUT_ROOT / "validation")
+        prepared = prepare_target(
+            args.target, output_root=DEFAULT_OUTPUT_ROOT / "validation", force=getattr(args, "force", False)
+        )
     except (HarborTaskError, HubError, ValueError, OSError, yaml.YAMLError) as exc:
         args._parser.error(str(exc))
     unvalidated = [task.task_id for task in prepared.tasks if not task.has_solution]
