@@ -948,6 +948,15 @@ def test_all_unloadable_tasks_still_record_reasons(tmp_path):
     assert "task.toml" in skipped["bad"]
 
 
+def test_harbor_task_data_schema_names_the_digest_key():
+    """The schema module may import only pydantic, so the key is spelled out; keep it equal to DIGEST_KEY."""
+    from resources_servers.harbor.task_data import TaskData
+
+    assert TaskData.model_fields["ng_digest"].alias == DIGEST_KEY
+    data = TaskData.model_validate({DIGEST_KEY: "abc", "other": 1})
+    assert data.ng_digest == "abc" and data.model_dump(by_alias=True)[DIGEST_KEY] == "abc"
+
+
 @pytest.mark.parametrize("taskset", ["ds", "terminal-bench-2.0", "trial=1", "中文=1"])
 def test_generated_run_passes_full_config_validation(tmp_path, monkeypatch, taskset):
     import sys
