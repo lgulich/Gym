@@ -65,6 +65,7 @@ from nemo_gym.server_utils import SESSION_ID_KEY
 from nemo_gym.tasks.harbor import DIGEST_KEY, HarborTask, load_task
 from nemo_gym.tasks.harbor.dataset_config import DATASET_FILE
 from nemo_gym.tasks.harbor.dockerfile import OverlayRun
+from nemo_gym.tasks.harbor.image_configs import load_compose_document
 from nemo_gym.tasks.harbor.models import HarborArtifact, HarborEnvironment
 from nemo_gym.tasks.harbor.task import HarborTaskError
 from resources_servers.harbor.sandbox_io import (
@@ -570,13 +571,9 @@ class HarborResourcesServer(SimpleResourcesServer):
 
     def _compose_document(self, task: HarborTask) -> dict[str, Any]:
         """The published overlay resolved against recorded image metadata, ready for the Compose adapter."""
-        compose_file = next(
-            task.path / "environment" / name
-            for name in ("docker-compose.yaml", "docker-compose.yml", "compose.yaml", "compose.yml")
-            if (task.path / "environment" / name).is_file()
-        )
         image_configs = self._compose_image_configs(task)
-        document = resolve_compose(yaml.safe_load(compose_file.read_text()), task.image, image_configs)
+        # The same reader prepare used: env_file inlined and ${VAR} resolved from the task, not the process.
+        document = resolve_compose(load_compose_document(task), task.image, image_configs)
         adapt_non_root_sidecars(document, image_configs)
         provider = resolve_provider_config(self._provider_ref(task), get_global_config_dict())
         if "opensandbox" in provider:

@@ -1474,6 +1474,31 @@ class TestComposeAndRouting:
         monkeypatch.setattr(server, "_create_compose", start_compose)
         return server, task, compose, documents
 
+    def test_compose_document_resolves_variables_and_env_file_from_the_task(self, tmp_path, monkeypatch):
+        # M19: the server reads the Compose file through the same resolver prepare used, so ${MAIN_IMAGE_NAME},
+        # ${CONTEXT_DIR} and an env_file resolve from the task alone, never from the server's process env.
+        server, task, compose, documents = self.compose_server(tmp_path, monkeypatch)
+        monkeypatch.setenv("KAFKA_TOPIC", "from-the-shell")
+        (task.path / "environment" / "docker-compose.yaml").write_text(
+            "services:\n"
+            "  main:\n    image: ${MAIN_IMAGE_NAME}\n    volumes: ['${CONTEXT_DIR}/seed.json:/app/seed.json:ro']\n"
+            "  api:\n    image: org/api:1\n    expose: ['3080']\n    env_file: api.env\n"
+            "  kafka:\n    image: org/kafka:1\n    environment: ['KAFKA_TOPIC=${KAFKA_TOPIC:-events}']\n"
+        )
+        (task.path / "environment" / "api.env").write_text("API_MODE=replay\n")
+        task = load_task(task.path)
+        server.config.tasksets["ds"].tasks["hello"] = task.digest
+        client = TestClient(server.setup_webserver())
+
+        response = client.post("/seed_session", json=seed_body(task))
+
+        assert response.status_code == 200, response.text
+        services = documents[0]["services"]
+        assert services["main"]["image"] == IMAGE_CONFIGS["org/agent:1"]["image"]
+        assert services["main"]["volumes"] == [f"{task.path / 'environment'}/seed.json:/app/seed.json:ro"]
+        assert services["api"]["environment"] == {"API_MODE": "replay"} and "env_file" not in services["api"]
+        assert services["kafka"]["environment"] == {"KAFKA_TOPIC": "events"}
+
     def test_compose_task_seeds_a_group_and_leaves_task_context(self, tmp_path, monkeypatch):
         server, task, compose, documents = self.compose_server(tmp_path, monkeypatch)
         client = TestClient(server.setup_webserver())
