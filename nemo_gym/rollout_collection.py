@@ -31,6 +31,7 @@ from datetime import timedelta
 from difflib import get_close_matches
 from itertools import repeat
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple, Union
 
 import orjson
@@ -101,6 +102,7 @@ from nemo_gym.rollout_observability import (
 )
 from nemo_gym.telemetry._fallbacks import is_span_group_enabled, managed_span
 from nemo_gym.telemetry.gym_metrics import UNREGISTERED_FAILURE_KIND, record_rollout_completed
+from nemo_gym.telemetry.runtime import MeteredAdmission, count_resident, driver_metrics, observe_event_loop
 from nemo_gym.telemetry.span_groups import GymSpanGroup
 
 
@@ -1285,6 +1287,14 @@ class DispatchLatencyTracker:
                 "These wrote no row and will be re-dispatched on resume."
             )
         return "\n".join(lines)
+
+
+def _record_output_write(started: float, serialized: bytes) -> None:
+    """Record how long one output row took to write and how large it was, while runtime metrics run."""
+    runtime_metrics = driver_metrics()
+    if runtime_metrics is not None:
+        runtime_metrics.write_duration.record(perf_counter() - started)
+        runtime_metrics.write_bytes.record(len(serialized) + 1)
 
 
 def _dispatch_drained_result(remaining_s: float, margin_s: Optional[float]) -> Dict[str, Any]:
@@ -2551,10 +2561,11 @@ class RolloutCollectionHelper(BaseModel):
         preset but deliberately not in `per_rollout`, where each rollout is meant to be
         its own bounded root trace.
         """
-        if not is_span_group_enabled(GymSpanGroup.JOB):
-            return await self._run_from_config(config)
-        with managed_span(GymSpanGroup.JOB, "gym.job"):
-            return await self._run_from_config(config)
+        async with observe_event_loop("driver"):
+            if not is_span_group_enabled(GymSpanGroup.JOB):
+                return await self._run_from_config(config)
+            with managed_span(GymSpanGroup.JOB, "gym.job"):
+                return await self._run_from_config(config)
 
     async def _run_from_config(self, config: RolloutCollectionConfig) -> Tuple[List[Dict]]:
         output_fpath = Path(config.output_jsonl_fpath)
@@ -2609,6 +2620,7 @@ class RolloutCollectionHelper(BaseModel):
             persisted_rows: List[Dict] = []
             persisted_results: List[Dict] = []
 
+            materialize_started = perf_counter()
             input_rows = self._preprocess_rows_from_config(config)
             # Returned rows are sorted by (r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME])
 
@@ -2648,6 +2660,9 @@ class RolloutCollectionHelper(BaseModel):
             with config.materialized_jsonl_fpath.open("wb") as f:
                 for row in tqdm(input_rows, desc="Writing materialized rows"):
                     f.write(orjson.dumps(row) + b"\n")
+            runtime_metrics = driver_metrics()
+            if runtime_metrics is not None:
+                runtime_metrics.materialize.record(perf_counter() - materialize_started)
             output_fpath.unlink(missing_ok=True)
             # A fresh run must not inherit retry attempts or published metrics
             # from an older run that used the same output path.
@@ -2942,16 +2957,20 @@ class RolloutCollectionHelper(BaseModel):
                         f"row={json.dumps(_rollout_request_debug_summary(row), sort_keys=True)} "
                         f"class={failure_class} error={detail}"
                     )
+                    write_started = perf_counter()
                     failures_file.write(serialized + b"\n")
                     failures_file.flush()
                     _record_rollout_outcome(result, "failed", dispatch_name)
+                    _record_output_write(write_started, serialized)
                     if batch_tracker is not None:
                         batch_failure_rows.append(_batch_status_row(result, batch_agent_refs))
                 else:
                     # Success → main jsonl.
+                    write_started = perf_counter()
                     results_file.write(serialized + b"\n")
                     results_file.flush()
                     _record_rollout_outcome(result, "scored", dispatch_name)
+                    _record_output_write(write_started, serialized)
                     persisted_count += 1
                     persisted_success_keys.add((result[TASK_INDEX_KEY_NAME], result[ROLLOUT_INDEX_KEY_NAME]))
                     if config.retain_results_in_memory:
@@ -3691,6 +3710,10 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
             if isinstance(block, DictConfig) and isinstance(block.get(ENVIRONMENT_SERVER_TYPE_KEY_NAME), DictConfig)
         }
         semaphore = semaphore or nullcontext()
+        runtime_metrics = driver_metrics()
+        if runtime_metrics is not None:
+            semaphore = MeteredAdmission(semaphore, runtime_metrics)
+            runtime_metrics.driver.offered += len(examples)
         tracker = latency_tracker if latency_tracker is not None else DispatchLatencyTracker()
         # `is not None`, not truthiness: 0.0 is a real budget that is already
         # spent, and must drain rather than disable the check.
@@ -3771,6 +3794,8 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                         tracker.record_failure(elapsed)
 
         awaitables = map(_post_subroutine, examples)
+        if runtime_metrics is not None:
+            awaitables = (count_resident(awaitable, runtime_metrics) for awaitable in awaitables)
         if max_resident_tasks is not None:
             return _BoundedCompletionIterator(
                 awaitables,
