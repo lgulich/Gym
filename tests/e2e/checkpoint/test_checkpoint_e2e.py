@@ -38,9 +38,12 @@ import yaml
 from checkpoint_deployment import (
     CAPTURE_CONTROL_TOKEN,
     COUNTER_SCRIPT,
+    NOTES_SCRIPT,
+    NOTES_SCRIPT_THREE,
     TOKEN,
     Deployment,
     counter_row,
+    notes_row,
     weather_episode,
     weather_row,
 )
@@ -1087,3 +1090,212 @@ async def test_mcp_tool_calls_wait_out_a_checkpoint_and_keep_their_sessions_acro
 
     # The checkpoint holds the counts from before the waiting calls ran.
     assert restored == [index + 10 for index in range(len(rollout_ids))]
+
+
+# -- sandboxed resources server ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("restore_resources", [True, False])
+async def test_a_sandbox_is_restored_with_the_episode(deploy, tmp_path: Path, restore_resources: bool) -> None:
+    deployment = deploy("sandbox")
+    deployment.backend("/_ctl/script", NOTES_SCRIPT)
+    # The first note is appended before the checkpoint; the model call that asks for the second is held.
+    deployment.backend("/_ctl/hold", {"after_calls": 1})
+    async with httpx.AsyncClient(base_url=deployment.url("environment"), timeout=120) as http:
+        first = asyncio.create_task(http.post("/run", json=notes_row("notes-1")))
+        await wait_until(lambda: len(deployment.backend_calls()) == 2)
+        await checkpoint(deployment, tmp_path / "ckpt", ["notes-1"])
+        at_commit = deployment.sandbox_state()
+        skip = () if restore_resources else ("resources",)
+        await crash_and_restore(deployment, tmp_path / "ckpt", ["notes-1"], skip_kinds=skip)
+        first.cancel()
+        replacement = await http.post("/run", json=notes_row("notes-1", attempt=1))
+        after = deployment.sandbox_state()
+        if restore_resources:
+            # The episode is over, but the checkpoint still names its snapshot. Once the controller publishes a
+            # checkpoint and drops c1, the restarted process deletes the snapshot the crashed one indexed.
+            await checkpoint(deployment, tmp_path / "ckpt2", [], checkpoint_id="c2")
+            participants = await deployment.participants()
+            await coordination.resume(participants, "c2", deadline_ts=deadline())
+            await coordination.release(participants, "c2", ["c2"], deadline_ts=deadline())
+            await wait_until(lambda: snapshot_ids(deployment) == set())
+
+    # The commit snapshotted the sandbox's files as of the checkpoint and left it running; nothing is paused.
+    [box] = at_commit["boxes"].values()
+    assert box["state"] == "running"
+    [snapshot] = [s for s in at_commit["snapshots"].values() if s["sandboxId"] == box["id"]]
+    assert snapshot["files"] == {"notes": "one\n"}
+    if restore_resources:
+        assert replacement.json()["reward"] == 1.0
+        # The restore forked the snapshot under a new id and stopped the crashed process's sandbox.
+        [fork] = [b for b in after["boxes"].values() if b["from_snapshot"] == snapshot["id"]]
+        assert after["boxes"][box["id"]]["state"] == "stopped"
+        assert fork["files"] == {"notes": "one\ntwo\n"}
+        # Verification ended the episode: its sandbox is freed and its snapshot kept until the release dropped c1.
+        assert fork["state"] == "stopped" and snapshot["id"] in after["snapshots"]
+    else:
+        # Without the resources restore the continued episode finds no sandbox: the negative control shows the
+        # restore matters.
+        assert replacement.status_code != 200 or replacement.json()["reward"] != 1.0
+
+
+async def test_a_sandbox_that_moved_on_after_the_checkpoint_is_rebuilt_from_its_snapshot(
+    deploy, tmp_path: Path
+) -> None:
+    deployment = deploy("sandbox")
+    deployment.backend("/_ctl/script", NOTES_SCRIPT_THREE)
+    deployment.backend("/_ctl/hold", {"after_calls": 1})
+    expected = ("one", "two", "three")
+    async with httpx.AsyncClient(base_url=deployment.url("environment"), timeout=120) as http:
+        first = asyncio.create_task(http.post("/run", json=notes_row("notes-2", expected=expected)))
+        await wait_until(lambda: len(deployment.backend_calls()) == 2)
+        await checkpoint(deployment, tmp_path / "ckpt", ["notes-2"])
+        [snapshot] = deployment.sandbox_state()["snapshots"].values()
+        # No crash yet: the episode continues past the checkpoint. Its next model call is released and asks for
+        # "two", which lands in the live sandbox; the call after that is held.
+        participants = await deployment.participants()
+        await coordination.resume(participants, "c1", deadline_ts=deadline())
+        assert deployment.sandbox_state()["boxes"][snapshot["sandboxId"]]["state"] == "running", "never paused"
+        deployment.backend("/_ctl/hold", {"after_calls": 2, "release_held": True})
+        await wait_until(lambda: len(deployment.backend_calls()) == 3)
+        await wait_until(
+            lambda: deployment.sandbox_state()["boxes"][snapshot["sandboxId"]]["files"] == {"notes": "one\ntwo\n"}
+        )
+        # Then every Gym process dies. The sandbox is no longer the checkpoint's: the restore rebuilds one from the
+        # snapshot, so the replayed "two" lands once, not twice.
+        await crash_and_restore(deployment, tmp_path / "ckpt", ["notes-2"])
+        first.cancel()
+        replacement = await http.post("/run", json=notes_row("notes-2", attempt=1, expected=expected))
+        after = deployment.sandbox_state()
+
+    assert replacement.json()["reward"] == 1.0
+    old = after["boxes"][snapshot["sandboxId"]]
+    [fork] = [box for box in after["boxes"].values() if box["from_snapshot"] == snapshot["id"]]
+    assert fork["files"] == {"notes": "one\ntwo\nthree\n"}
+    # The crashed process's sandbox was superseded and stopped, its drift discarded.
+    assert old["state"] == "stopped" and old["files"] == {"notes": "one\ntwo\n"}
+
+
+async def test_retiring_a_sandboxed_episode_stops_its_sandbox(deploy, tmp_path: Path) -> None:
+    deployment = deploy("sandbox")
+    deployment.backend("/_ctl/script", NOTES_SCRIPT)
+    deployment.backend("/_ctl/hold", {"after_calls": 1})
+    async with httpx.AsyncClient(base_url=deployment.url("environment"), timeout=120) as http:
+        run = asyncio.create_task(http.post("/run", json=notes_row("notes-3")))
+        await wait_until(lambda: len(deployment.backend_calls()) == 2)
+        participants = await deployment.participants()
+
+        await coordination.retire(participants, "retire", [EpisodeId(rollout_id="notes-3")], deadline_ts=deadline())
+
+        await wait_until(run.done, timeout=10)
+        retired = deployment.sandbox_state()
+        deployment.backend("/_ctl/release", {})
+        # The rollout restarts from its input as the next attempt, in a fresh sandbox.
+        replacement = await http.post("/run", json=notes_row("notes-3", attempt=1))
+        after = deployment.sandbox_state()
+
+    [box] = retired["boxes"].values()
+    assert box["state"] == "stopped" and box["files"] == {"notes": "one\n"}
+    assert replacement.json()["reward"] == 1.0
+    assert len(after["boxes"]) == 2
+    assert retired["snapshots"] == {}, "a retire takes no snapshot"
+
+
+# -- releasing snapshots ----------------------------------------------------------------------------------
+
+
+def snapshot_ids(deployment: Deployment) -> set[str]:
+    return set(deployment.sandbox_state()["snapshots"])
+
+
+async def test_a_release_deletes_only_the_snapshots_of_checkpoints_the_controller_dropped(
+    deploy, tmp_path: Path
+) -> None:
+    deployment = deploy("sandbox")
+    deployment.backend("/_ctl/script", NOTES_SCRIPT_THREE)
+    deployment.backend("/_ctl/hold", {"after_calls": 1})
+    expected = ("one", "two", "three")
+    async with httpx.AsyncClient(base_url=deployment.url("environment"), timeout=120) as http:
+        run = asyncio.create_task(http.post("/run", json=notes_row("rel-1", expected=expected)))
+        await wait_until(lambda: len(deployment.backend_calls()) == 2)
+        participants = await deployment.participants()
+        # Two checkpoints of the same episode, each taking its own snapshot of the sandbox.
+        await checkpoint(deployment, tmp_path / "c1", ["rel-1"], checkpoint_id="c1")
+        await coordination.resume(participants, "c1", deadline_ts=deadline())
+        first = snapshot_ids(deployment)
+        await coordination.release(participants, "c1", ["c1"], deadline_ts=deadline())
+        deployment.backend("/_ctl/hold", {"after_calls": 2, "release_held": True})
+        await wait_until(lambda: len(deployment.backend_calls()) == 3)
+        await checkpoint(deployment, tmp_path / "c2", ["rel-1"], checkpoint_id="c2")
+        await coordination.resume(participants, "c2", deadline_ts=deadline())
+        both = snapshot_ids(deployment)
+
+        # The controller prunes c1: only its snapshot goes, while the episode keeps running.
+        await coordination.release(participants, "c2", ["c2"], deadline_ts=deadline())
+        await wait_until(lambda: snapshot_ids(deployment) == both - first)
+        second = snapshot_ids(deployment)
+        deployment.backend("/_ctl/release", {})
+        response = await run
+        # The episode is verified; c2 still names its snapshot until the run is complete.
+        verified = snapshot_ids(deployment)
+        await coordination.release(participants, "done", [], deadline_ts=deadline())
+        await wait_until(lambda: snapshot_ids(deployment) == set())
+
+    assert len(first) == 1 and len(both) == 2
+    [kept] = second
+    assert response.json()["reward"] == 1.0
+    assert verified == {kept}
+    assert not any((deployment.work_dir / "gym-state").rglob("*/snapshots/*/*")), "the index is empty"
+
+
+async def test_after_a_crash_a_release_deletes_the_snapshots_of_a_checkpoint_never_published(
+    deploy, tmp_path: Path
+) -> None:
+    deployment = deploy("sandbox")
+    deployment.backend("/_ctl/script", NOTES_SCRIPT_THREE)
+    deployment.backend("/_ctl/hold", {"after_calls": 1})
+    expected = ("one", "two", "three")
+    async with httpx.AsyncClient(base_url=deployment.url("environment"), timeout=120) as http:
+        run = asyncio.create_task(http.post("/run", json=notes_row("rel-2", expected=expected)))
+        await wait_until(lambda: len(deployment.backend_calls()) == 2)
+        participants = await deployment.participants()
+        await checkpoint(deployment, tmp_path / "c1", ["rel-2"], checkpoint_id="c1")
+        await coordination.resume(participants, "c1", deadline_ts=deadline())
+        published = snapshot_ids(deployment)
+        deployment.backend("/_ctl/hold", {"after_calls": 2, "release_held": True})
+        await wait_until(lambda: len(deployment.backend_calls()) == 3)
+        # c2 commits, then every Gym process dies before the controller publishes it.
+        await checkpoint(deployment, tmp_path / "c2", ["rel-2"], checkpoint_id="c2")
+        unpublished = snapshot_ids(deployment) - published
+        await crash_and_restore(deployment, tmp_path / "c1", ["rel-2"])
+        run.cancel()
+        replacement = await http.post("/run", json=notes_row("rel-2", attempt=1, expected=expected))
+        participants = await deployment.participants()
+        await checkpoint(deployment, tmp_path / "c3", [], checkpoint_id="c3")
+        await coordination.resume(participants, "c3", deadline_ts=deadline())
+        # The new process never heard of c2; the index the dead one wrote did.
+        await coordination.release(participants, "c3", ["c3"], deadline_ts=deadline())
+        await wait_until(lambda: snapshot_ids(deployment) == set())
+
+    assert len(published) == 1 and len(unpublished) == 1
+    assert replacement.json()["reward"] == 1.0
+
+
+async def test_release_is_refused_while_a_checkpoint_is_open(deploy, tmp_path: Path) -> None:
+    deployment = deploy("sandbox")
+    deployment.backend("/_ctl/script", NOTES_SCRIPT)
+    deployment.backend("/_ctl/hold", {"after_calls": 1})
+    async with httpx.AsyncClient(base_url=deployment.url("environment"), timeout=120) as http:
+        run = asyncio.create_task(http.post("/run", json=notes_row("rel-3")))
+        await wait_until(lambda: len(deployment.backend_calls()) == 2)
+        participants = await deployment.participants()
+        await checkpoint(deployment, tmp_path / "c1", ["rel-3"], checkpoint_id="c1")
+        with pytest.raises(coordination.CoordinationError):
+            await coordination.release(participants, "c0", [], deadline_ts=deadline())
+        committed = snapshot_ids(deployment)
+        await coordination.resume(participants, "c1", deadline_ts=deadline())
+        deployment.backend("/_ctl/release", {})
+        response = await run
+
+    assert len(committed) == 1 and snapshot_ids(deployment) == committed
+    assert response.json()["reward"] == 1.0
