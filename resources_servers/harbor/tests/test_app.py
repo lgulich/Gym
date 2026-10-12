@@ -39,9 +39,9 @@ storage_mb = 10240
 """
 
 
-def write_task(root: Path, *, dockerfile: str = "FROM ubuntu:24.04\nWORKDIR /app") -> Path:
+def write_task(root: Path, *, toml: str = TASK_TOML, dockerfile: str = "FROM ubuntu:24.04\nWORKDIR /app") -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    (root / "task.toml").write_text(TASK_TOML)
+    (root / "task.toml").write_text(toml)
     (root / "instruction.md").write_text("Create hello.txt\n")
     (root / "environment").mkdir(exist_ok=True)
     (root / "environment" / "Dockerfile").write_text(dockerfile)
@@ -69,6 +69,7 @@ class FakeSandbox:
     test_result: SandboxExecResult = SandboxExecResult(stdout="", stderr="", return_code=0)
     execs: list[dict] = field(default_factory=list)
     uploads: list[tuple[Path, str]] = field(default_factory=list)
+    uploaded_archives: list[bytes] = field(default_factory=list)
     stopped: bool = False
 
     async def exec(self, command, *, cwd=None, env=None, timeout_s=None, user=None):
@@ -79,6 +80,7 @@ class FakeSandbox:
 
     async def upload(self, local_path, remote_path):
         self.uploads.append((Path(local_path), remote_path))
+        self.uploaded_archives.append(Path(local_path).read_bytes())
 
     async def download(self, remote_path, local_path):
         Path(local_path).write_bytes(archive_of(self.verifier_files))
@@ -95,10 +97,11 @@ def make_server(
     monkeypatch: MonkeyPatch,
     sandbox: FakeSandbox | None = None,
     *,
+    toml: str = TASK_TOML,
     dockerfile: str = "FROM ubuntu:24.04\nWORKDIR /app",
 ):
     folder = tmp_path / "datasets" / "ds"
-    task = load_task(write_task(folder / "hello", dockerfile=dockerfile))
+    task = load_task(write_task(folder / "hello", toml=toml, dockerfile=dockerfile))
     config = HarborResourcesServerConfig(
         host="0.0.0.0",
         port=8080,
@@ -111,7 +114,7 @@ def make_server(
     sandbox = sandbox or FakeSandbox()
     created: list[tuple] = []
 
-    async def create(task, workdir):
+    async def create(task, workdir, *, session_id=None):
         created.append((task.task_id, workdir))
         return sandbox
 
@@ -166,7 +169,6 @@ class TestRewardFile:
             ("reward.txt", "yes", "not valid"),
             ("reward.json", "[1]", "non-empty JSON object"),
             ("reward.json", '{"reward": "1"}', "not a finite number"),
-            ("reward.json", '{"reward": true}', "not a finite number"),
         ],
     )
     def test_problems(self, tmp_path, name, text, fragment):
@@ -177,21 +179,17 @@ class TestRewardFile:
     def test_missing(self, tmp_path):
         assert parse_reward_file(tmp_path)[1] == "no reward.json or reward.txt was written"
 
-    def test_invalid_json_falls_back_to_text(self, tmp_path):
-        (tmp_path / "reward.json").write_text("{not json")
+    @pytest.mark.parametrize("contents", ["{not json", "[]", "", '{"reward": "1"}'])
+    def test_invalid_json_does_not_fall_back_to_text(self, tmp_path, contents):
+        (tmp_path / "reward.json").write_text(contents)
         (tmp_path / "reward.txt").write_text("0.5\n")
-        assert parse_reward_file(tmp_path) == ({"reward": 0.5}, None)
-
-        # A well-formed but unusable reward.json also falls back.
-        (tmp_path / "reward.json").write_text("[]")
-        assert parse_reward_file(tmp_path) == ({"reward": 0.5}, None)
-
-        # When both are unusable, the problem names both files.
-        (tmp_path / "reward.txt").write_text("maybe")
         rewards, problem = parse_reward_file(tmp_path)
         assert rewards is None
-        assert "reward.json must hold a non-empty JSON object" in problem
-        assert "reward.txt is not valid" in problem
+        assert "reward.json" in problem
+
+    def test_boolean_rewards_match_harbor(self, tmp_path):
+        (tmp_path / "reward.json").write_text('{"passed": true, "failed": false}')
+        assert parse_reward_file(tmp_path) == ({"passed": 1.0, "failed": 0.0}, None)
 
     def test_non_utf8_bytes_do_not_raise(self, tmp_path):
         (tmp_path / "reward.txt").write_bytes(b"\xff\xfe1\n")
@@ -200,7 +198,8 @@ class TestRewardFile:
 
         (tmp_path / "reward.json").write_bytes(b'{"reward": 1}\xff')
         (tmp_path / "reward.txt").write_text("0.25\n")
-        assert parse_reward_file(tmp_path) == ({"reward": 0.25}, None)
+        assert parse_reward_file(tmp_path)[0] is None
+        assert "reward.json is not valid" in parse_reward_file(tmp_path)[1]
 
 
 class TestSeed:
@@ -251,7 +250,9 @@ class TestSeed:
         assert client.post("/seed_session", json=second).status_code == 200
 
         assert created == [("hello", "/app"), ("hello", "/app")]
-        assert loads == [task.path]
+        assert len(loads) == 1
+        assert loads[0] != task.path
+        assert load_task(loads[0]).digest == task.digest
 
     def test_seed_rejects_bad_identity(self, tmp_path, monkeypatch):
         server, task, _, created = make_server(tmp_path, monkeypatch)
@@ -275,7 +276,7 @@ class TestSeed:
     def test_seed_reports_sandbox_failure_as_retryable(self, tmp_path, monkeypatch):
         server, task, _, _ = make_server(tmp_path, monkeypatch)
 
-        async def boom(task, workdir):
+        async def boom(task, workdir, *, session_id):
             raise RuntimeError("pull failed")
 
         monkeypatch.setattr(server, "_create_sandbox", boom)
@@ -337,11 +338,15 @@ class TestVerify:
         run = next(call for call in sandbox.execs if "test.sh" in call["command"])
         assert run["command"] == "bash /tests/test.sh > /logs/verifier/test-stdout.txt 2>&1"
         assert run["cwd"] == "/app" and run["timeout_s"] == 120.0
-        # A root image needs no user override for the prepare step.
+        commands = [call["command"] for call in sandbox.execs]
+        wipe = next(i for i, command in enumerate(commands) if "-mindepth 1 -delete" in command)
+        upload = next(i for i, command in enumerate(commands) if "tar -xzf" in command and "/tests" in command)
+        assert wipe < upload < commands.index(run["command"])
+        # An image may have a non-root default even when the task has no user override.
         prepare = next(
             call for call in sandbox.execs if "chmod 777" in call["command"] and "/tests" in call["command"]
         )
-        assert prepare["user"] is None and prepare["cwd"] == "/"
+        assert prepare["user"] == "root" and prepare["cwd"] == "/"
         # tests/ was uploaded as an archive and unpacked into /tests.
         assert any(remote.endswith(".tar.gz") for _, remote in sandbox.uploads)
         assert any("tar -xzf" in call["command"] and "/tests" in call["command"] for call in sandbox.execs)
@@ -359,9 +364,12 @@ class TestVerify:
                 return result
 
         server, task, sandbox, _ = make_server(
-            tmp_path, monkeypatch, NonRootSandbox(), dockerfile="FROM ubuntu:24.04\nWORKDIR /app\nUSER app"
+            tmp_path,
+            monkeypatch,
+            NonRootSandbox(),
+            toml=TASK_TOML.replace("[environment]", '[environment]\ndocker_image = "nonroot:latest"'),
         )
-        assert task.user == "app"
+        assert task.user is None
         client = TestClient(server.setup_webserver())
         assert client.post("/seed_session", json=seed_body(task)).status_code == 200
 
@@ -404,6 +412,9 @@ class TestVerify:
         response = client.post("/verify", json=verify_body())
         assert response.status_code == 422
         assert "several keys" in response.json()["detail"]
+        again = client.post("/verify", json=verify_body())
+        assert again.status_code == 422 and again.json() == response.json()
+        assert sum("test.sh" in call["command"] for call in sandbox.execs) == 1
 
     def test_missing_reward_scores_zero_and_is_measured(self, tmp_path, monkeypatch):
         sandbox = FakeSandbox(

@@ -29,8 +29,7 @@ class TaskData(BaseModel):
 
     # The wire key is ``_ng_digest`` (nemo_gym.tasks.harbor.DIGEST_KEY); pydantic forbids a leading
     # underscore in a field name, so the field is addressed by alias.
-    ng_digest: str | None = Field(
-        default=None,
+    ng_digest: str = Field(
         alias="_ng_digest",
         description="Content hash of the task folder when the row was materialized.",
         json_schema_extra={"consumed_by": ["verify", "provenance"]},
