@@ -15,7 +15,9 @@ harbor_resources_server:
       sandbox_provider_options: {}
       sandbox_metadata:
         benchmark: harbor
-      artifacts_dir: results/harbor/verifier
+      artifacts_dir: ${results_dir}/harbor/verifier
+      # Closed IDs are retained only for this many recent sessions; active locks are never evicted.
+      closed_session_cache_size: 10000
 
       # taskset name -> {folder, tasks: {task_id: digest}}; written by the loader.
       tasksets: {}

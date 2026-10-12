@@ -23,18 +23,22 @@ import asyncio
 import json
 import logging
 import math
+import os
+import re
 import shlex
-import sys
+import shutil
+import tempfile
+from collections import OrderedDict
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from traceback import format_exc
 from typing import Any, ClassVar, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from nemo_gym import failure_kinds
+from nemo_gym import RESULTS_DIR, failure_kinds
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
     BaseVerifyRequest,
@@ -54,7 +58,7 @@ from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_me
 from nemo_gym.server_utils import SESSION_ID_KEY
 from nemo_gym.tasks.harbor import DIGEST_KEY, HarborTask, load_task
 from nemo_gym.tasks.harbor.task import HarborTaskError
-from resources_servers.harbor.sandbox_io import download_dir, upload_dir
+from resources_servers.harbor.sandbox_io import _exec_as_root, download_dir, upload_dir
 
 
 LOGGER = logging.getLogger(__name__)
@@ -115,7 +119,9 @@ class HarborResourcesServerConfig(BaseResourcesServerConfig):
     sandbox_provider_options: dict[str, Any] = Field(default_factory=dict)
     sandbox_metadata: dict[str, str] = Field(default_factory=dict)
     # Verifier logs are downloaded here, one folder per resources session.
-    artifacts_dir: Path = Path("results/harbor/verifier")
+    artifacts_dir: Path | None = None
+    # Retain recent close tombstones while releasing idle session locks immediately.
+    closed_session_cache_size: int = Field(default=10000, ge=1)
 
 
 @dataclass
@@ -127,29 +133,43 @@ class HarborSession:
     workdir: str
     # The first verify's outcome; a retried /verify replays it instead of re-running test.sh.
     verify_outcome: dict[str, Any] | None = None
+    verify_error: tuple[int, str] | None = None
+
+
+@dataclass
+class _SessionLock:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
+_ENV_TEMPLATE = re.compile(r"\$\{([^}:]+)(?::-(.*))?\}")
+
+
+def resolve_env_templates(env: dict[str, str]) -> dict[str, str]:
+    """Resolve Harbor's whole-value host templates without changing the stored task."""
+    resolved: dict[str, str] = {}
+    for key, value in env.items():
+        match = _ENV_TEMPLATE.fullmatch(value)
+        if match is None:
+            resolved[key] = value
+        elif match.group(1) in os.environ:
+            resolved[key] = os.environ[match.group(1)]
+        elif match.group(2) is not None:
+            resolved[key] = match.group(2)
+        else:
+            raise HTTPException(422, f"Environment variable {match.group(1)!r} is required by the task")
+    return resolved
 
 
 def parse_reward_file(directory: Path) -> tuple[dict[str, float] | None, str | None]:
-    """Read Harbor's reward file.
-
-    Returns ``(rewards, problem)``: ``rewards`` is the parsed mapping (``reward.txt``
-    becomes ``{"reward": value}``) or ``None``; ``problem`` names what went wrong.
-    ``reward.json`` is preferred; when it is missing or unusable, ``reward.txt`` is tried.
-    """
-    problems: list[str] = []
+    """Read reward.json when present; only a missing JSON file falls back to reward.txt."""
     for path in (directory / "reward.json", directory / "reward.txt"):
-        if not path.is_file():
-            continue
-        rewards, problem = _parse_one_reward_file(path)
-        if rewards is not None:
-            return rewards, None
-        problems.append(problem)
-    if not problems:
-        return None, "no reward.json or reward.txt was written"
-    return None, "; ".join(problems)
+        if path.is_file():
+            return _parse_one_reward_file(path)
+    return None, "no reward.json or reward.txt was written"
 
 
-def _parse_one_reward_file(path: Path) -> tuple[dict[str, float] | None, str]:
+def _parse_one_reward_file(path: Path) -> tuple[dict[str, float] | None, str | None]:
     # The verifier wrote these bytes; never let a stray non-UTF-8 byte escape as an exception.
     text = path.read_text(errors="replace").strip()
     if not text:
@@ -162,7 +182,7 @@ def _parse_one_reward_file(path: Path) -> tuple[dict[str, float] | None, str]:
         return None, f"{path.name} must hold a non-empty JSON object"
     rewards: dict[str, float] = {}
     for key, value in raw.items():
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
             return None, f"{path.name}: {key!r} is not a finite number"
         rewards[str(key)] = float(value)
     return rewards, None
@@ -175,23 +195,6 @@ def select_reward(rewards: dict[str, float]) -> float | None:
     if len(rewards) == 1:
         return next(iter(rewards.values()))
     return None
-
-
-def _is_root(user: str | None) -> bool:
-    return user is None or str(user).split(":")[0] in ("root", "0")
-
-
-async def _exec_as_root_user(
-    sandbox: AsyncSandbox, command: str, *, configured_user: str | None, cwd: str = "/", timeout_s: float = 60
-):
-    """Run ``command`` as root.
-
-    ``configured_user`` is the user the sandbox runs commands as by default (the image's
-    ``USER`` or ``[agent].user``). Only a non-root default needs the ``user="root"``
-    override; root images keep the plain exec path every provider supports.
-    """
-    user = None if _is_root(configured_user) else "root"
-    return await sandbox.exec(command, cwd=cwd, timeout_s=timeout_s, user=user)
 
 
 def _sandbox_resources(task: HarborTask) -> dict[str, Any]:
@@ -217,11 +220,18 @@ class HarborResourcesServer(SimpleResourcesServer):
     def model_post_init(self, context: Any, /) -> None:
         super().model_post_init(context)
         self._sessions: dict[str, HarborSession] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
-        # Parsed tasks by (folder, materialized digest): hash a task folder once per server, not per episode.
-        self._tasks: dict[tuple[Path, str], HarborTask] = {}
-        self._closed: set[str] = set()
+        self._locks: dict[str, _SessionLock] = {}
+        # Ownership starts before sandbox.start(), and ends only after stop() succeeds.
+        self._sandboxes: dict[str, AsyncSandbox] = {}
+        self._tasks: dict[tuple[Path, str], asyncio.Task[HarborTask]] = {}
+        self._snapshots = tempfile.TemporaryDirectory(prefix="nemo-gym-harbor-tasks-")
+        self._closed: OrderedDict[str, None] = OrderedDict()
         self._shutting_down = False
+        artifacts = self.config.artifacts_dir
+        if artifacts is None or not artifacts.is_absolute():
+            results_root = Path(get_global_config_dict().get("results_dir", RESULTS_DIR)).resolve()
+            artifacts = results_root / (artifacts if artifacts is not None else "harbor/verifier")
+        self._artifacts_dir = artifacts.resolve()
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -238,15 +248,59 @@ class HarborResourcesServer(SimpleResourcesServer):
         app.router.lifespan_context = lifespan
         return app
 
+    @asynccontextmanager
+    async def _session_lock(self, session_id: str) -> AsyncIterator[None]:
+        entry = self._locks.setdefault(session_id, _SessionLock())
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            # Waiters already hold this entry; never replace their lock with a new one.
+            if entry.users == 0:
+                del self._locks[session_id]
+
+    async def _stop_sandbox(self, session_id: str) -> None:
+        sandbox = self._sandboxes.get(session_id)
+        if sandbox is not None:
+            await sandbox.stop()
+            del self._sandboxes[session_id]
+        self._sessions.pop(session_id, None)
+
     async def shutdown(self) -> None:
         self._shutting_down = True
-        sessions = list(self._sessions.values())
-        self._sessions.clear()
-        for session in sessions:
-            try:
-                await session.sandbox.stop()
-            except Exception:
-                print("Failed to stop abandoned Harbor sandbox", format_exc(), file=sys.stderr)
+        # Include seeds still loading a task, before they have acquired a sandbox.
+        for session_id in list(self._sandboxes.keys() | self._locks.keys()):
+            async with self._session_lock(session_id):
+                try:
+                    await self._stop_sandbox(session_id)
+                except Exception:
+                    LOGGER.exception("Failed to stop abandoned Harbor sandbox")
+        pending = [task for task in self._tasks.values() if not task.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if not self._sandboxes:
+            await asyncio.to_thread(self._snapshots.cleanup)
+            self._tasks.clear()
+
+    def _snapshot_task(self, folder: Path, expected: str) -> HarborTask:
+        snapshot_root = Path(tempfile.mkdtemp(dir=self._snapshots.name))
+        try:
+            snapshot = snapshot_root / folder.name
+            shutil.copytree(folder, snapshot, symlinks=True)
+            task = load_task(snapshot)
+            if task.digest != expected:
+                raise HTTPException(
+                    409, f"Task folder {folder} changed since materialization; re-materialize the taskset"
+                )
+            return task
+        except (OSError, HarborTaskError) as exc:
+            shutil.rmtree(snapshot_root)
+            raise HTTPException(422, f"Could not snapshot task {folder}: {exc}") from exc
+        except BaseException:
+            shutil.rmtree(snapshot_root)
+            raise
 
     # -- task resolution -------------------------------------------------------------------
 
@@ -264,18 +318,19 @@ class HarborResourcesServer(SimpleResourcesServer):
                 f"Row digest for {task_id.task_id!r} does not match the taskset mapping; re-materialize the taskset",
             )
         folder = Path(taskset.folder) / task_id.task_id
-        task = self._tasks.get((folder, expected))
-        if task is not None:
-            return task
-        try:
-            # Parsing task.toml and hashing the folder are blocking file work.
-            task = await asyncio.to_thread(load_task, folder)
-        except HarborTaskError as exc:
-            raise HTTPException(422, str(exc)) from exc
-        if task.digest != expected:
-            raise HTTPException(409, f"Task folder {folder} changed since materialization; re-materialize the taskset")
-        self._tasks[(folder, expected)] = task
-        return task
+        key = (folder, expected)
+        pending = self._tasks.get(key)
+        if pending is None:
+            # Concurrent first seeds share the same copy/hash, including if a caller is cancelled.
+            pending = asyncio.create_task(asyncio.to_thread(self._snapshot_task, folder, expected))
+            self._tasks[key] = pending
+
+            def remove_failed_load(done: asyncio.Task[HarborTask]) -> None:
+                if done.cancelled() or done.exception() is not None:
+                    self._tasks.pop(key, None)
+
+            pending.add_done_callback(remove_failed_load)
+        return pending.result() if pending.done() else await asyncio.shield(pending)
 
     # -- sandbox ---------------------------------------------------------------------------
 
@@ -292,15 +347,16 @@ class HarborResourcesServer(SimpleResourcesServer):
             ttl_s=ttl,
             ready_timeout_s=self.config.sandbox_ready_timeout_s,
             workdir=workdir,
-            env=dict(task.env),
+            env=resolve_env_templates(task.env),
             metadata=metadata,
             resources=_sandbox_resources(task),
             provider_options=dict(self.config.sandbox_provider_options),
         )
 
-    async def _create_sandbox(self, task: HarborTask, workdir: str) -> AsyncSandbox:
+    async def _create_sandbox(self, task: HarborTask, workdir: str, *, session_id: str) -> AsyncSandbox:
         provider_config = resolve_provider_config(self.config.sandbox_provider, get_global_config_dict())
         sandbox = AsyncSandbox(provider_config)
+        self._sandboxes[session_id] = sandbox
         await sandbox.start(self._sandbox_spec(task, workdir))
         return sandbox
 
@@ -308,9 +364,19 @@ class HarborResourcesServer(SimpleResourcesServer):
         commands = [f"mkdir -p {shlex.quote(workdir)}"]
         if task.user:
             commands.append(f"chown {shlex.quote(task.user)} {shlex.quote(workdir)}")
-        result = await _exec_as_root_user(sandbox, " && ".join(commands), configured_user=task.user)
+        result = await _exec_as_root(sandbox, " && ".join(commands), timeout_s=60)
         if result.return_code != 0:
             raise RuntimeError(f"Could not prepare {workdir}: {result.stderr or result.stdout}")
+        environment_dir = task.path / "environment"
+        if (
+            task.config.environment.docker_image
+            and environment_dir.is_dir()
+            and not any(
+                (environment_dir / name).exists()
+                for name in ("Dockerfile", "docker-compose.yaml", "docker-compose.yml")
+            )
+        ):
+            await upload_dir(sandbox, environment_dir, workdir)
 
     async def _sandbox_access(self, session: HarborSession) -> SandboxAccess:
         return SandboxAccess(
@@ -328,8 +394,9 @@ class HarborResourcesServer(SimpleResourcesServer):
             raise HTTPException(503, "Resources server is shutting down")
         session_id = body.resources_session_id
         request.session[SESSION_ID_KEY] = session_id
-        lock = self._locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
+        async with self._session_lock(session_id):
+            if self._shutting_down:
+                raise HTTPException(503, "Resources server is shutting down")
             if session_id in self._closed:
                 raise HTTPException(409, f"Resources session is already closed: {session_id}")
             existing = self._sessions.get(session_id)
@@ -345,13 +412,23 @@ class HarborResourcesServer(SimpleResourcesServer):
                 raise HTTPException(
                     422, f"Task {task.task_id!r} declares no image; sandbox-less tasks are not supported yet"
                 )
+            if not task.config.is_shared_verifier:
+                raise HTTPException(422, "Separate verification is not supported yet")
+            if task.user is not None:
+                raise HTTPException(
+                    422, "Agent user overrides ([agent].user or Dockerfile USER) are not supported yet"
+                )
+            # Fail before provisioning; retain templates in the snapshot and resolve at use time.
+            resolve_env_templates(task.env)
+            resolve_env_templates(task.config.verifier.env)
+            if self._shutting_down:
+                raise HTTPException(503, "Resources server is shutting down")
+            if session_id in self._sandboxes:
+                raise HTTPException(503, "Previous sandbox cleanup failed; close this session before retrying")
             workdir = task.workdir or DEFAULT_WORKDIR
             try:
-                sandbox = await self._create_sandbox(task, workdir)
-            except Exception as exc:
-                LOGGER.exception(f"Sandbox creation failed for {task.task_id}")
-                raise HTTPException(503, f"Could not start sandbox for {task.task_id!r}: {exc}") from exc
-            try:
+                sandbox = await self._create_sandbox(task, workdir, session_id=session_id)
+                self._sandboxes[session_id] = sandbox
                 await self._prepare_workdir(sandbox, task, workdir)
                 session = HarborSession(
                     task=task,
@@ -361,9 +438,14 @@ class HarborResourcesServer(SimpleResourcesServer):
                     workdir=workdir,
                 )
                 access = await self._sandbox_access(session)
-            except Exception as exc:
-                await sandbox.stop()
-                LOGGER.exception(f"Sandbox setup failed for {task.task_id}")
+            except BaseException as exc:
+                try:
+                    await self._stop_sandbox(session_id)
+                except Exception:
+                    LOGGER.exception("Failed to stop Harbor sandbox after failed seed")
+                if not isinstance(exc, Exception):
+                    raise
+                LOGGER.exception("Sandbox setup failed for %s", task.task_id)
                 raise HTTPException(503, f"Could not set up sandbox for {task.task_id!r}: {exc}") from exc
             self._sessions[session_id] = session
             return ResourcesSeedSessionResponse(resources_session_id=session_id, sandbox_access=access)
@@ -381,11 +463,17 @@ class HarborResourcesServer(SimpleResourcesServer):
         session_id = request.session.get(SESSION_ID_KEY)
         if not session_id:
             raise HTTPException(404, "Unknown Harbor resources session; seed it first")
-        lock = self._locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
+        async with self._session_lock(session_id):
             session = self._session_for(request, body.ng_digest)
+            if session.verify_error is not None:
+                raise HTTPException(*session.verify_error)
             if session.verify_outcome is None:
-                session.verify_outcome = await self._run_verifier(session, session_id)
+                try:
+                    session.verify_outcome = await self._run_verifier(session, session_id)
+                except HTTPException as exc:
+                    # Cache only the error data, not a traceback retaining request/sandbox state.
+                    session.verify_error = (exc.status_code, str(exc.detail))
+                    raise
             outcome = session.verify_outcome
         return HarborVerifyResponse(
             responses_create_params=body.responses_create_params,
@@ -398,10 +486,10 @@ class HarborResourcesServer(SimpleResourcesServer):
         task = session.task
         sandbox = session.sandbox
         settings = task.config.verifier
-        logs_dir = self.config.artifacts_dir / session_id
+        logs_dir = self._artifacts_dir / session_id
         try:
             # /logs/verifier is root-owned from seed; a non-root image user cannot reset it.
-            prepare = await _exec_as_root_user(
+            prepare = await _exec_as_root(
                 sandbox,
                 " && ".join(
                     [
@@ -410,7 +498,7 @@ class HarborResourcesServer(SimpleResourcesServer):
                         f"chmod 777 {TESTS_DIR} {VERIFIER_LOGS_DIR} {AGENT_LOGS_DIR}",
                     ]
                 ),
-                configured_user=task.user,
+                timeout_s=60,
             )
             if prepare.return_code != 0:
                 raise RuntimeError(f"Could not prepare verifier directories: {prepare.stderr or prepare.stdout}")
@@ -418,7 +506,7 @@ class HarborResourcesServer(SimpleResourcesServer):
             result = await sandbox.exec(
                 f"bash {TESTS_DIR}/test.sh > {VERIFIER_STDOUT} 2>&1",
                 cwd=session.workdir,
-                env=dict(settings.env),
+                env=resolve_env_templates(settings.env),
                 timeout_s=settings.timeout_sec,
                 user=settings.user,
             )
@@ -462,15 +550,15 @@ class HarborResourcesServer(SimpleResourcesServer):
         self, request: Request, body: ResourcesCloseSessionRequest
     ) -> ResourcesCloseSessionResponse:
         session_id = body.resources_session_id
-        lock = self._locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
+        async with self._session_lock(session_id):
             session = self._sessions.get(session_id)
             if session is not None and session.identity[0] != body.episode_id:
                 raise HTTPException(409, "episode_id does not match the seeded resources session")
-            if session is not None:
-                await session.sandbox.stop()
-                del self._sessions[session_id]
-            self._closed.add(session_id)
+            await self._stop_sandbox(session_id)
+            self._closed[session_id] = None
+            self._closed.move_to_end(session_id)
+            while len(self._closed) > self.config.closed_session_cache_size:
+                self._closed.popitem(last=False)
             request.session.pop(SESSION_ID_KEY, None)
             return ResourcesCloseSessionResponse(resources_session_id=session_id)
 
