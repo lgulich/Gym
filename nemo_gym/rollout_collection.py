@@ -102,7 +102,7 @@ from nemo_gym.rollout_observability import (
 )
 from nemo_gym.telemetry._fallbacks import is_span_group_enabled, managed_span
 from nemo_gym.telemetry.gym_metrics import UNREGISTERED_FAILURE_KIND, record_rollout_completed
-from nemo_gym.telemetry.runtime import MeteredAdmission, count_resident, driver_metrics, observe_event_loop
+from nemo_gym.telemetry.observer import MeteredAdmission, count_resident, driver_metrics, observe_event_loop
 from nemo_gym.telemetry.span_groups import GymSpanGroup
 
 
@@ -1290,37 +1290,37 @@ class DispatchLatencyTracker:
 
 
 def _record_output_write(started: float, serialized: bytes) -> None:
-    """Record how long one output row took to write and how large it was, while runtime metrics run."""
-    runtime_metrics = driver_metrics()
-    if runtime_metrics is not None:
-        runtime_metrics.write_duration.record(perf_counter() - started)
-        runtime_metrics.write_bytes.record(len(serialized) + 1)
+    """Record how long one output row took to write and how large it was, while metrics are exporting."""
+    observer = driver_metrics()
+    if observer is not None:
+        observer.write_duration.record(perf_counter() - started)
+        observer.write_bytes.record(len(serialized) + 1)
 
 
 def _record_rollout_shape(row: Mapping[str, Any], result: Mapping[str, Any]) -> None:
-    """Record the size of one completed rollout, while runtime metrics run.
+    """Record the size of one completed rollout, while metrics are exporting.
 
     Turns and tool calls come from the rollout's ``ng_perf`` when rollout observability produced it.
     Without it, tool calls are counted from the final response's ``function_call`` items, and turns are not recorded.
     """
-    runtime_metrics = driver_metrics()
-    if runtime_metrics is None:
+    observer = driver_metrics()
+    if observer is None:
         return
     try:
         input_items = (row.get("responses_create_params") or {}).get("input")
         if isinstance(input_items, list):
-            runtime_metrics.input_items.record(len(input_items))
+            observer.input_items.record(len(input_items))
         output_items = ((result.get("response") or {}).get("output")) or []
-        runtime_metrics.output_items.record(len(output_items))
+        observer.output_items.record(len(output_items))
         ng_perf = result.get(NG_PERF_KEY) or {}
         if "num_turns" in ng_perf:
-            runtime_metrics.turns.record(ng_perf["num_turns"])
+            observer.turns.record(ng_perf["num_turns"])
         tool_calls = ng_perf.get("num_tool_calls")
         if tool_calls is None:
             tool_calls = sum(
                 1 for item in output_items if isinstance(item, dict) and item.get("type") == "function_call"
             )
-        runtime_metrics.tool_calls.record(tool_calls)
+        observer.tool_calls.record(tool_calls)
     except Exception:
         logger.debug("Could not record rollout shape metrics", exc_info=True)
 
@@ -2688,9 +2688,9 @@ class RolloutCollectionHelper(BaseModel):
             with config.materialized_jsonl_fpath.open("wb") as f:
                 for row in tqdm(input_rows, desc="Writing materialized rows"):
                     f.write(orjson.dumps(row) + b"\n")
-            runtime_metrics = driver_metrics()
-            if runtime_metrics is not None:
-                runtime_metrics.materialize.record(perf_counter() - materialize_started)
+            observer = driver_metrics()
+            if observer is not None:
+                observer.materialize.record(perf_counter() - materialize_started)
             output_fpath.unlink(missing_ok=True)
             # A fresh run must not inherit retry attempts or published metrics
             # from an older run that used the same output path.
@@ -3739,10 +3739,10 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
             if isinstance(block, DictConfig) and isinstance(block.get(ENVIRONMENT_SERVER_TYPE_KEY_NAME), DictConfig)
         }
         semaphore = semaphore or nullcontext()
-        runtime_metrics = driver_metrics()
-        if runtime_metrics is not None:
-            semaphore = MeteredAdmission(semaphore, runtime_metrics)
-            runtime_metrics.driver.offered += len(examples)
+        observer = driver_metrics()
+        if observer is not None:
+            semaphore = MeteredAdmission(semaphore, observer)
+            observer.driver.offered += len(examples)
         tracker = latency_tracker if latency_tracker is not None else DispatchLatencyTracker()
         # `is not None`, not truthiness: 0.0 is a real budget that is already
         # spent, and must drain rather than disable the check.
@@ -3823,8 +3823,8 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                         tracker.record_failure(elapsed)
 
         awaitables = map(_post_subroutine, examples)
-        if runtime_metrics is not None:
-            awaitables = (count_resident(awaitable, runtime_metrics) for awaitable in awaitables)
+        if observer is not None:
+            awaitables = (count_resident(awaitable, observer) for awaitable in awaitables)
         if max_resident_tasks is not None:
             return _BoundedCompletionIterator(
                 awaitables,
