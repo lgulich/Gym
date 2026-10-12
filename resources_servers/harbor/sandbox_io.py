@@ -4,6 +4,7 @@
 """Directory transfers through sandbox exec, upload and download."""
 
 import asyncio
+import logging
 import shlex
 import tarfile
 import tempfile
@@ -12,6 +13,9 @@ from uuid import uuid4
 
 from nemo_gym.sandbox import AsyncSandbox
 from nemo_gym.sandbox.providers.base import SandboxExecResult
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class SandboxTransferError(RuntimeError):
@@ -26,9 +30,20 @@ def _pack(source: Path, archive: Path) -> None:
             tar.add(child, arcname=child.name)
 
 
-def _unpack(archive: Path, target: Path) -> None:
+def _unpack(archive: Path, target: Path, *, names: tuple[str, ...] | None = None, skip_unsafe: bool = False) -> None:
+    def safe_member(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo | None:
+        if names is not None and member.name.removeprefix("./") not in names:
+            return None
+        try:
+            return tarfile.data_filter(member, destination)
+        except tarfile.FilterError:
+            if not skip_unsafe:
+                raise
+            LOGGER.warning("Skipping unsafe diagnostic archive member %r", member.name)
+            return None
+
     with tarfile.open(archive, "r:gz") as tar:
-        tar.extractall(target, filter="data")
+        tar.extractall(target, filter=safe_member)
 
 
 # Transfers run as root: the image's default user may not be allowed to create `/tests`,
@@ -75,17 +90,34 @@ async def upload_dir(sandbox: AsyncSandbox, source: Path, target: str, *, timeou
         raise SandboxTransferError(f"Failed to unpack {source} into {target}: {result.stderr or result.stdout}")
 
 
-async def download_dir(sandbox: AsyncSandbox, source: str, target: Path, *, timeout_s: float = 600) -> None:
+async def download_dir(
+    sandbox: AsyncSandbox,
+    source: str,
+    target: Path,
+    *,
+    timeout_s: float = 600,
+    names: tuple[str, ...] | None = None,
+    skip_unsafe: bool = False,
+) -> None:
     """Copy the contents of ``source`` inside the sandbox into the local ``target`` folder."""
     target.mkdir(parents=True, exist_ok=True)
     remote = f"/tmp/.nemo-gym-download-{uuid4().hex}.tar.gz"
-    result = await _exec_as_root(sandbox, f"tar -czf {remote} -C {shlex.quote(source)} .", timeout_s=timeout_s)
+    command = f"tar -czf {remote} -C {shlex.quote(source)} ."
+    if names is not None:
+        # An empty archive is valid: a verifier that writes no reward scores a measured zero.
+        entries = " ".join(shlex.quote(name) for name in names)
+        command = (
+            f"cd {shlex.quote(source)} && "
+            f'for name in {entries}; do if test -e "$name" || test -L "$name"; '
+            f"then printf '%s\\0' \"$name\"; fi; done | tar -czf {remote} --null -T -"
+        )
+    result = await _exec_as_root(sandbox, command, timeout_s=timeout_s)
     if result.return_code:
         raise SandboxTransferError(f"Failed to archive {source}: {result.stderr or result.stdout}")
     try:
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "download.tar.gz"
             await sandbox.download(remote, archive)
-            await asyncio.to_thread(_unpack, archive, target)
+            await asyncio.to_thread(_unpack, archive, target, names=names, skip_unsafe=skip_unsafe)
     finally:
         await _exec_as_root(sandbox, f"rm -f {remote}", timeout_s=60)

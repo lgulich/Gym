@@ -308,7 +308,7 @@ class TestSeed:
 
         assert spec.image == "ubuntu:24.04"
         assert spec.workdir == "/app"
-        assert spec.ttl_s == 300 + 120 + server.config.sandbox_ttl_slack_s
+        assert spec.ttl_s == 21600 + 180 + server.config.sandbox_ttl_slack_s
         assert (spec.resources.cpu, spec.resources.memory_mib, spec.resources.disk_gib) == (1.0, 2048, 10)
         assert spec.metadata["sandbox-api"] == "osb"
         assert spec.metadata["harbor_task"] == "hello"

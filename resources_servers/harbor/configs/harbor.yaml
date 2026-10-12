@@ -10,7 +10,10 @@ harbor_resources_server:
       # Top-level sandbox provider block in the merged config (see nemo_gym/sandbox/providers/*/configs).
       sandbox_provider: sandbox
       sandbox_ready_timeout_s: 900
-      # Sandbox lifetime = [agent].timeout_sec + [verifier].timeout_sec + this slack.
+      # The loader links these to the owning environment's actual episode and cleanup budgets.
+      episode_timeout_seconds: 21600
+      cleanup_timeout_seconds: 180
+      # Sandbox lifetime covers the full episode, final cleanup, and this slack.
       sandbox_ttl_slack_s: 900
       sandbox_provider_options: {}
       sandbox_metadata:
@@ -21,3 +24,9 @@ harbor_resources_server:
 
       # taskset name -> {folder, tasks: {task_id: digest}}; written by the loader.
       tasksets: {}
+
+      datasets:
+        - name: example
+          type: example
+          license: Apache-2.0
+          jsonl_fpath: resources_servers/harbor/data/example.jsonl

@@ -18,7 +18,10 @@ format; Gym owns execution. The supported subset is listed below.
   the most recent `closed_session_cache_size` closed IDs are retained (default 10,000).
 
 When `test.sh` ran, the sample counts. A missing or invalid reward file scores 0 with a `failure_kind`.
-Only a Gym-side failure (sandbox lost, transfer failed) sets `mask_sample`. An existing `reward.json`
+Only a required infrastructure failure (sandbox lost, reward transfer failed) sets `mask_sample`.
+Diagnostic logs are best effort: unsafe archive entries are skipped securely, and a diagnostic
+transfer failure cannot discard an already measured reward. Verifier timeouts score zero and retain
+available logs. An existing `reward.json`
 takes precedence even if malformed; `reward.txt` is read only when JSON is absent. Boolean JSON rewards
 are numeric, as in Harbor. Gym selects the `reward` key or the only key; multiple keys without `reward`
 are an authoring error (422) because Gym requires one scalar score.
@@ -39,7 +42,8 @@ are an authoring error (422) because Gym requires one scalar score.
 
 Clearing `/tests` and `/logs/verifier` before verification is a deliberate difference from Harbor's
 single-step shared mode, which merges tests. It prevents agent-planted reward files or test helpers
-from being used. Helpers baked into `/tests` in an image are also removed; ship required helpers in
+from being used. Linked verification roots (including `/logs`) are unlinked before preparation,
+without deleting their former targets. Helpers baked into `/tests` in an image are also removed; ship required helpers in
 the task's `tests/` directory instead. Preparation and transfers attempt root, with a fallback to the
 default image user when switching identity is unavailable. Target directory ownership and modes are
 preserved during extraction.
@@ -49,7 +53,16 @@ preserved during extraction.
 See [`configs/harbor.yaml`](configs/harbor.yaml) for this layer's supported settings. Verifier logs default
 to `${results_dir}/harbor/verifier/<resources_session_id>`, using Gym's absolute results root. An explicit
 relative `artifacts_dir` is relative to that root; an absolute path is used directly. Responses always
-include an absolute `verifier_logs_dir` when logs were downloaded.
+include an absolute `verifier_logs_dir` naming the collection location; that directory can be empty
+if optional log collection fails.
+
+Hermes honors the task's `[agent].timeout_sec` via the materialized `agent_timeout_sec` metadata,
+using the smaller of that deadline and its configured runner limit. The verifier uses
+`[verifier].timeout_sec`. Sandbox lifetime covers the owning environment's full episode budget,
+its final cleanup budget, and `sandbox_ttl_slack_s`, so setup and queued agent work also fit.
+The loader links these budgets to the generated environment's configuration. When wiring a server
+manually, match `episode_timeout_seconds` and `cleanup_timeout_seconds` to that environment; the
+episode must have a finite deadline. Sandboxes are normally stopped as soon as the episode ends.
 
 Resource settings come from the task. `sandbox_resources_override`, `gpu_sandbox_provider`,
 `request_gpu_type` and `verifier_grace_s` belong to later stack layers and are not configuration options
@@ -59,3 +72,27 @@ in this PR.
 datasets folder (`$NEMO_GYM_DATASETS_DIR`, default `./datasets`). A local task folder, or a folder of task
 folders, works the same way. Running model episodes additionally requires a compatible agent harness
 that borrows the sandbox access returned by this server.
+
+
+## Example data
+
+`data/tasks/` contains five small Apache-2.0 terminal tasks: copying a file, numeric sorting,
+deduplicating lines, uppercasing text, and selecting the first line. Each uses `ubuntu:24.04`, a
+60-second agent limit, and a 30-second verifier limit. The verifier compares the output byte for
+byte with a fixture held outside the agent workdir.
+
+`data/example.jsonl` contains their materialized rows. `data/example_rollouts.jsonl` records actual
+Qwen2.5-0.5B-Instruct commands, execution results, and verifier outputs; `data/example_metrics.json`
+records their measured scores and runtime. These are smoke examples from a single-command harness,
+not a Hermes benchmark. They used llama.cpp on CPU and Enroot sandboxes with an in-process handoff
+because Enroot cannot serialize sandbox access. Provider expiration and the distributed handoff
+were not exercised by these examples.
+
+To run the bundled tasks with Hermes and a configured sandbox provider and model:
+
+```bash
+gym eval run resources_servers/harbor/data/tasks --agent hermes --config <provider-and-model.yaml>
+```
+
+The loader generates the task mapping and dataset rows for that run. Keep `verified: false` until
+the benchmark has been profiled and reviewed with its intended harness and model.

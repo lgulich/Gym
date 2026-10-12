@@ -878,7 +878,15 @@ async def test_runner_exit_without_cleanup_receipt_blocks_close(agent, state, re
     state.session.sandbox.disconnect.assert_awaited_once()
 
 
-@pytest.mark.parametrize("overrides", [{}, {"temperature": 0.0}])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"temperature": 0.0},
+        {"metadata": {"agent_timeout_sec": "900"}},
+        {"metadata": {"agent_timeout_sec": "999999"}},
+    ],
+)
 async def test_session_prompt_and_limits_reach_runner(agent, state, overrides, tmp_path, monkeypatch):
     state.session.session_dir = str(tmp_path)
     monkeypatch.setattr(hermes_sandbox, "_SANDBOX_PYTHON", sys.executable)
@@ -905,12 +913,14 @@ async def test_session_prompt_and_limits_reach_runner(agent, state, overrides, t
     launch_command = state.session.sandbox.exec.await_args_list[0].args[0]
     launch_args = shlex.split(launch_command)
     assert any(arg.endswith("/process_supervisor.py") for arg in launch_args)
-    assert float(launch_args[launch_args.index("--timeout") + 1]) == agent.config.sandbox_runner_timeout_seconds
+    expected_timeout = min(
+        float(overrides.get("metadata", {}).get("agent_timeout_sec", "inf")),
+        agent.config.sandbox_runner_timeout_seconds,
+    )
+    assert float(launch_args[launch_args.index("--timeout") + 1]) == expected_timeout
     cleanup_timeout = float(launch_args[launch_args.index("--cleanup-timeout") + 1])
     assert cleanup_timeout == agent.config.session_close_timeout_seconds / 3
-    assert state.session.sandbox.exec.await_args_list[0].kwargs["timeout_s"] > (
-        agent.config.sandbox_runner_timeout_seconds + 3 * cleanup_timeout
-    )
+    assert state.session.sandbox.exec.await_args_list[0].kwargs["timeout_s"] > (expected_timeout + 3 * cleanup_timeout)
     # Execute the real launch prefix: cleanup must receive the shell's PID, not a literal "$".
     launch_prefix, separator, _ = launch_command.partition(" && exec ")
     assert separator
@@ -1211,3 +1221,19 @@ async def test_failed_setup_retains_handle_until_cleanup_confirmed(
         sandbox.disconnect.assert_not_awaited()
     else:
         sandbox.stop.assert_not_awaited()
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1", "nan", "inf", "-inf", "bad", "9" * 400])
+async def test_invalid_task_deadline_rejected_before_activation(agent, state, timeout):
+    body = NeMoGymResponseCreateParamsNonStreaming(input="task", metadata={"agent_timeout_sec": timeout})
+    with pytest.raises(HTTPException) as error:
+        await agent.responses(request(state), body)
+    assert error.value.status_code == 422
+    assert "finite positive" in error.value.detail
+    assert state.task is None
+
+
+async def test_task_deadline_requires_sandbox_session(agent):
+    body = NeMoGymResponseCreateParamsNonStreaming(input="task", metadata={"agent_timeout_sec": "900"})
+    with pytest.raises(HTTPException, match="requires a sandbox agent session"):
+        await agent.responses(SimpleNamespace(session={}), body)

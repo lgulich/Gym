@@ -119,6 +119,12 @@ def run_config(
             "resources_servers": {
                 RESOURCES_SERVER_IMPL: {
                     "sandbox_provider": sandbox_provider,
+                    "episode_timeout_seconds": (
+                        f"${{{environment_name}.environment_servers.single_agent_turn.default_episode_timeout_seconds}}"
+                    ),
+                    "cleanup_timeout_seconds": (
+                        f"${{{environment_name}.environment_servers.single_agent_turn.cleanup_timeout_seconds}}"
+                    ),
                     # Verifier logs sit beside the run's rollouts, as an absolute path: the server
                     # process runs from its own folder, so a relative default would land there.
                     "artifacts_dir": str(Path(rows_path).resolve().parent / "verifier"),

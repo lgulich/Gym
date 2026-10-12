@@ -15,6 +15,7 @@
 import asyncio
 import atexit
 import logging
+import math
 import os
 import shutil
 import sys
@@ -580,7 +581,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
         }
         output = await state.execute(
             payload,
-            timeout=self.config.sandbox_runner_timeout_seconds,
+            timeout=self._sandbox_runner_timeout(body),
             close_timeout=self.config.session_close_timeout_seconds,
         )
         result = output.get("result")
@@ -613,6 +614,22 @@ class HermesAgent(SimpleResponsesAPIAgent):
             observations=self._sandbox_observations(result, output.get("observations"), runtime_info=runtime),
         )
 
+    def _sandbox_runner_timeout(self, body: NeMoGymResponseCreateParamsNonStreaming) -> float:
+        """Apply a materialized task's agent deadline within the configured runner limit."""
+        metadata = body.metadata or {}
+        if metadata.keys() - {"agent_timeout_sec"}:
+            raise HTTPException(422, "Hermes only supports agent_timeout_sec in request metadata")
+        value = metadata.get("agent_timeout_sec")
+        if value is None:
+            return self.config.sandbox_runner_timeout_seconds
+        try:
+            timeout = float(value)
+        except (ValueError, OverflowError):
+            raise HTTPException(422, "agent_timeout_sec must be a finite positive number") from None
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise HTTPException(422, "agent_timeout_sec must be a finite positive number")
+        return min(timeout, self.config.sandbox_runner_timeout_seconds)
+
     def _validate_request(
         self,
         body: NeMoGymResponseCreateParamsNonStreaming,
@@ -626,7 +643,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 "Hermes does not support the total max_output_tokens budget; "
                 "configure max_tokens for a per-model-call limit instead",
             )
-        supported = {"input", "instructions", "temperature", "model"}
+        self._sandbox_runner_timeout(body)
+        supported = {"input", "instructions", "temperature", "model", "metadata"}
         # Fail closed for new schema fields instead of silently accepting unimplemented controls.
         for name, field in type(body).model_fields.items():
             if name in supported:
@@ -893,6 +911,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
             # A disconnected HTTP waiter must not cancel the shared activation. Session close
             # owns cancellation; identical retries join this task or replay its result/error.
             return (await asyncio.shield(state.task)).model_copy(deep=True)
+        if (body.metadata or {}).get("agent_timeout_sec") is not None:
+            raise HTTPException(422, "agent_timeout_sec requires a sandbox agent session")
         if not isinstance(rollout_id, str):
             return await self._create_response(body)
         episode = await self._create_episode(body, rollout_id=rollout_id)
