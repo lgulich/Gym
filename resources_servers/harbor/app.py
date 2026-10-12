@@ -114,7 +114,9 @@ class HarborResourcesServerConfig(BaseResourcesServerConfig):
     # Name of the top-level sandbox provider block in the merged config.
     sandbox_provider: str = "sandbox"
     sandbox_ready_timeout_s: float = Field(default=900, gt=0)
-    # Sandbox lifetime = agent timeout + verifier timeout + this slack.
+    # Cover the owning environment's full episode (including setup/queueing) and final cleanup.
+    episode_timeout_seconds: float = Field(default=21600, gt=0, allow_inf_nan=False)
+    cleanup_timeout_seconds: float = Field(default=180, gt=0, allow_inf_nan=False)
     sandbox_ttl_slack_s: float = Field(default=900, ge=0)
     sandbox_provider_options: dict[str, Any] = Field(default_factory=dict)
     sandbox_metadata: dict[str, str] = Field(default_factory=dict)
@@ -182,9 +184,15 @@ def _parse_one_reward_file(path: Path) -> tuple[dict[str, float] | None, str | N
         return None, f"{path.name} must hold a non-empty JSON object"
     rewards: dict[str, float] = {}
     for key, value in raw.items():
-        if not isinstance(value, (int, float)) or not math.isfinite(value):
+        if not isinstance(value, (int, float)):
             return None, f"{path.name}: {key!r} is not a finite number"
-        rewards[str(key)] = float(value)
+        try:
+            value = float(value)
+        except OverflowError:
+            return None, f"{path.name}: {key!r} is not a finite number"
+        if not math.isfinite(value):
+            return None, f"{path.name}: {key!r} is not a finite number"
+        rewards[str(key)] = value
     return rewards, None
 
 
@@ -341,7 +349,9 @@ class HarborResourcesServer(SimpleResourcesServer):
             | self.config.sandbox_metadata
             | {"nemo_gym_resources_server": self.config.name, "harbor_task": task.task_id[:63]}
         )
-        ttl = task.config.agent.timeout_sec + task.config.verifier.timeout_sec + self.config.sandbox_ttl_slack_s
+        ttl = (
+            self.config.episode_timeout_seconds + self.config.cleanup_timeout_seconds + self.config.sandbox_ttl_slack_s
+        )
         return SandboxSpec(
             image=task.image,
             ttl_s=ttl,
@@ -488,11 +498,15 @@ class HarborResourcesServer(SimpleResourcesServer):
         settings = task.config.verifier
         logs_dir = self._artifacts_dir / session_id
         try:
-            # /logs/verifier is root-owned from seed; a non-root image user cannot reset it.
+            # Replace agent-planted directory links before cleanup: find does not follow its starting
+            # symlink, while tar does. Unlink /logs first without touching its former target.
+            roots = (str(Path(VERIFIER_LOGS_DIR).parent), TESTS_DIR, VERIFIER_LOGS_DIR, AGENT_LOGS_DIR)
+            unlink_roots = [f"if test -L {shlex.quote(path)}; then rm -- {shlex.quote(path)}; fi" for path in roots]
             prepare = await _exec_as_root(
                 sandbox,
                 " && ".join(
-                    [
+                    unlink_roots
+                    + [
                         f"mkdir -p {TESTS_DIR} {VERIFIER_LOGS_DIR} {AGENT_LOGS_DIR}",
                         f"find {TESTS_DIR} {VERIFIER_LOGS_DIR} -mindepth 1 -delete",
                         f"chmod 777 {TESTS_DIR} {VERIFIER_LOGS_DIR} {AGENT_LOGS_DIR}",
@@ -510,13 +524,12 @@ class HarborResourcesServer(SimpleResourcesServer):
                 timeout_s=settings.timeout_sec,
                 user=settings.user,
             )
-            if result.error_type == "timeout":
-                return self._measured(
-                    0.0, VERIFIER_TIMEOUT_KIND, f"test.sh exceeded [verifier].timeout_sec={settings.timeout_sec}"
-                )
-            if result.error_type is not None:
+            if result.error_type not in (None, "timeout"):
                 return self._masked(failure_kinds.VERIFIER_ERROR, f"test.sh could not run: {result.error_type}")
-            await download_dir(sandbox, VERIFIER_LOGS_DIR, logs_dir)
+            if result.error_type != "timeout":
+                # Reward transfer is required; optional diagnostics cannot invalidate a measured score.
+                await download_dir(sandbox, VERIFIER_LOGS_DIR, logs_dir, names=("reward.json", "reward.txt"))
+                rewards, problem = parse_reward_file(logs_dir)
         except HTTPException:
             raise
         except Exception as exc:
@@ -526,7 +539,17 @@ class HarborResourcesServer(SimpleResourcesServer):
         # Absolute, so the row names a folder that exists from wherever the run was launched; the server
         # process runs from its own folder, where a relative artifacts_dir would otherwise resolve.
         extras = {"verifier_return_code": result.return_code, "verifier_logs_dir": str(Path(logs_dir).resolve())}
-        rewards, problem = parse_reward_file(logs_dir)
+        try:
+            await download_dir(sandbox, VERIFIER_LOGS_DIR, logs_dir, skip_unsafe=True)
+        except Exception:
+            LOGGER.warning("Could not collect optional verifier logs for %s", task.task_id, exc_info=True)
+        if result.error_type == "timeout":
+            return (
+                self._measured(
+                    0.0, VERIFIER_TIMEOUT_KIND, f"test.sh exceeded [verifier].timeout_sec={settings.timeout_sec}"
+                )
+                | extras
+            )
         if rewards is None:
             kind = MISSING_REWARD_KIND if "written" in (problem or "") else INVALID_REWARD_KIND
             return self._measured(0.0, kind, f"{problem}; tail: {_stdout_tail(logs_dir)}") | extras

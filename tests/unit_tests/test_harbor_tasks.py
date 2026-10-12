@@ -878,6 +878,12 @@ def test_config_overlays_win_after_real_loading_and_inheritance(tmp_path):
     parser._recursively_swap_keys(config)
     assert config.harbor_ds_agent.responses_api_agents.hermes_agent.max_turns == 71
     assert config.harbor_ds_environment.environment_servers.single_agent_turn.default_episode_timeout_seconds == 1234
+    resources = config.harbor_ds_resources_server.resources_servers.harbor
+    assert resources.episode_timeout_seconds == 1234
+    assert (
+        resources.cleanup_timeout_seconds
+        == config.harbor_ds_environment.environment_servers.single_agent_turn.cleanup_timeout_seconds
+    )
 
 
 @pytest.mark.parametrize("skip", [False, True])
