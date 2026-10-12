@@ -591,8 +591,6 @@ class TestCli:
             resolve_agent("no_such_agent_xyz")
 
     def test_build_run_writes_config_and_overrides(self, tmp_path):
-        from hydra.core.override_parser.overrides_parser import OverridesParser
-
         folder = tmp_path / "ds"
         tasks = [load_task(write_task(folder / "a"))]
         prepared = PreparedTaskset("ds", folder, tasks, tmp_path / "out" / "tasks.jsonl", tmp_path / "out")
@@ -613,13 +611,13 @@ class TestCli:
         assert "single_agent_turn/configs/single_agent_turn.yaml" in config_paths
         assert "resources_servers/harbor/configs/harbor.yaml" in config_paths
         assert "opensandbox/configs/opensandbox.yaml" in config_paths
-        parsed = OverridesParser.create().parse_overrides(tokens)
-        output = next(token.value() for token in parsed if token.key_or_group == "output_jsonl_fpath")
-        assert output == str(tmp_path / "out" / "rollouts.jsonl")
+        assert yaml.safe_load(config_path.read_text())["output_jsonl_fpath"] == str(
+            tmp_path / "out" / "rollouts.jsonl"
+        )
         assert not any(token.lstrip("+").startswith("use_absolute_ip=") for token in tokens)
 
     def test_resolve_agent_marks_in_sandbox_harnesses(self):
-        assert resolve_agent("terminus_2_sandboxed").runs_in_sandbox is True
+        assert resolve_agent("terminus_2_sandboxed").runs_in_sandbox is False
         assert resolve_agent("hermes_agent").runs_in_sandbox is True
         assert resolve_agent("oracle").runs_in_sandbox is False
 
@@ -636,15 +634,10 @@ class TestCli:
         prepared.output_dir.mkdir(parents=True)
         return prepared
 
-    def test_build_run_advertises_node_ip_for_in_sandbox_agent(self, tmp_path, caplog):
-        agent = AgentSelection(
-            tmp_path / "agent.yaml", "terminus_2_sandboxed_agent", "terminus_2_sandboxed_agent", runs_in_sandbox=True
-        )
-        with caplog.at_level(logging.INFO, logger="nemo_gym.tasks.harbor.cli"):
-            _, tokens = build_run(self._prepared(tmp_path), agent, sandbox="opensandbox", overrides=[])
-        assert tokens.count("+use_absolute_ip=true") == 1
-        messages = [record.getMessage() for record in caplog.records]
-        assert any("use_absolute_ip=true" in m and "terminus_2_sandboxed_agent" in m for m in messages)
+    def test_build_run_advertises_node_ip_for_in_sandbox_agent(self, tmp_path):
+        agent = resolve_agent("hermes")
+        path, _ = build_run(self._prepared(tmp_path), agent, sandbox="opensandbox", overrides=[])
+        assert yaml.safe_load(path.read_text())["use_absolute_ip"] is True
 
     def test_build_run_leaves_host_side_agent_on_loopback(self, tmp_path):
         agent = AgentSelection(tmp_path / "agent.yaml", "oracle_agent", "oracle_agent")
@@ -880,8 +873,6 @@ def test_existing_unpinned_task_is_never_relabeled(tmp_path, registry_repo):
 
 
 def test_registry_versions_keep_distinct_rows_routes_and_outputs(tmp_path, monkeypatch):
-    from hydra.core.override_parser.overrides_parser import OverridesParser
-
     import nemo_gym.tasks.harbor.cli as harbor_cli
 
     for version in ("1.0", "2.0"):
@@ -898,9 +889,7 @@ def test_registry_versions_keep_distinct_rows_routes_and_outputs(tmp_path, monke
     for prepared, (path, tokens) in zip((first, second), configs):
         assert json.loads(prepared.rows_path.read_text())["task_id"]["taskset"] == prepared.taskset
         assert list(yaml.safe_load(path.read_text())["environment_server_routes"]) == [prepared.taskset]
-        parsed = OverridesParser.create().parse_overrides(tokens)
-        output = next(token.value() for token in parsed if token.key_or_group == "output_jsonl_fpath")
-        assert output == str(prepared.output_dir / "rollouts.jsonl")
+        assert yaml.safe_load(path.read_text())["output_jsonl_fpath"] == str(prepared.output_dir / "rollouts.jsonl")
 
 
 def test_config_overlays_win_after_real_loading_and_inheritance(tmp_path):

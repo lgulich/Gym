@@ -13,7 +13,7 @@ A task without ``solution/solve.sh`` is not failed: the oracle returns a respons
 tagged ``oracle=unvalidated`` and does nothing in the sandbox.
 """
 
-import shlex
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
@@ -21,7 +21,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import Body, HTTPException, Request
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import (
@@ -48,6 +48,7 @@ from nemo_gym.sandbox.config import resolve_provider_config
 from nemo_gym.sandbox.providers import create_provider
 from nemo_gym.tasks.harbor import HarborTask, load_task
 from nemo_gym.tasks.harbor.task import HarborTaskError
+from resources_servers.harbor.app import resolve_env_templates
 from resources_servers.harbor.sandbox_io import upload_dir
 
 
@@ -64,7 +65,7 @@ class OracleAgentConfig(BaseResponsesAPIAgentConfig):
     # The `harbor` resources server whose `tasksets` mapping locates task folders.
     resources_server: ResourcesServerRef
     # Wall-clock cap for solve.sh when the task's [agent].timeout_sec is larger.
-    max_solve_timeout_s: float = 3600.0
+    max_solve_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     output_tail_chars: int = 4000
 
 
@@ -145,17 +146,20 @@ class OracleAgent(SimpleResponsesAPIAgent):
     ) -> NeMoGymResponse:
         session = self._session_for(request)
         task_id = session.request.task_id
-        task = self._load_task(task_id.taskset, task_id.task_id)
+        task = await asyncio.to_thread(self._load_task, task_id.taskset, task_id.task_id)
         if not task.has_solution:
             return self._response(body, ORACLE_STATUS_UNVALIDATED, "No solution/solve.sh in the task folder.", {})
 
         settings = task.config
-        timeout = min(settings.agent.timeout_sec, self.config.max_solve_timeout_s)
+        timeout = settings.agent.timeout_sec
+        if self.config.max_solve_timeout_s is not None:
+            timeout = min(timeout, self.config.max_solve_timeout_s)
+        env = {"DEBIAN_FRONTEND": "noninteractive", **resolve_env_templates(settings.solution.env)}
         await upload_dir(session.sandbox, task.path / "solution", SOLUTION_DIR)
         result = await session.sandbox.exec(
             f"bash {SOLUTION_DIR}/solve.sh",
             cwd=session.workdir,
-            env=dict(settings.solution.env),
+            env=env,
             timeout_s=timeout,
             user=task.user,
         )
@@ -198,10 +202,6 @@ class OracleAgent(SimpleResponsesAPIAgent):
 
     async def run(self, body: BaseRunRequest = Body()) -> BaseVerifyResponse:
         raise HTTPException(501, "The oracle agent runs only through an environment server, not the legacy /run route")
-
-
-def quote(value: str) -> str:
-    return shlex.quote(value)
 
 
 if __name__ == "__main__":
