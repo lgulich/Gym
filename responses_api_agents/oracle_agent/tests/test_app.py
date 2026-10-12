@@ -21,7 +21,6 @@ schema_version = "1.4"
 
 [agent]
 timeout_sec = 120.0
-user = "runner"
 
 [solution.env]
 GREETING = "hi"
@@ -31,12 +30,12 @@ cpus = 1
 """
 
 
-def write_task(root: Path, *, solution: bool = True) -> Path:
+def write_task(root: Path, *, solution: bool = True, toml: str = TASK_TOML) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    (root / "task.toml").write_text(TASK_TOML)
+    (root / "task.toml").write_text(toml)
     (root / "instruction.md").write_text("Create hello.txt\n")
     (root / "environment").mkdir(exist_ok=True)
-    (root / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\nWORKDIR /app")
+    (root / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\nWORKDIR /app\nUSER runner")
     (root / "tests").mkdir(exist_ok=True)
     (root / "tests" / "test.sh").write_text("#!/bin/bash\n")
     if solution:
@@ -65,9 +64,16 @@ class FakeSandbox:
         self.disconnected = True
 
 
-def make_agent(tmp_path: Path, monkeypatch: MonkeyPatch, *, solution: bool = True, sandbox: FakeSandbox | None = None):
+def make_agent(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    *,
+    solution: bool = True,
+    sandbox: FakeSandbox | None = None,
+    toml: str = TASK_TOML,
+):
     folder = tmp_path / "datasets" / "ds"
-    task = load_task(write_task(folder / "hello", solution=solution))
+    task = load_task(write_task(folder / "hello", solution=solution, toml=toml))
     global_config = {
         "sandbox": {"opensandbox": {"connection": {"domain": "example.invalid"}}},
         "harbor_rs": {
@@ -135,7 +141,7 @@ def test_oracle_runs_solution_in_borrowed_sandbox(tmp_path, monkeypatch):
     assert run == {
         "command": "bash /solution/solve.sh",
         "cwd": "/app",
-        "env": {"GREETING": "hi"},
+        "env": {"DEBIAN_FRONTEND": "noninteractive", "GREETING": "hi"},
         "timeout_s": 120.0,
         "user": "runner",
     }
@@ -227,3 +233,74 @@ def test_unknown_task_lookup(tmp_path, monkeypatch, taskset, task_id, status):
     body["task_id"] = {"taskset": taskset, "task_id": task_id}
     assert client.post("/v1/agent_sessions", json=body).status_code == 200
     assert client.post("/v1/responses", json=RESPONSES_BODY).status_code == status
+
+
+@pytest.mark.parametrize("cap,expected", [(None, 7200.0), (8000.0, 7200.0), (60.0, 60.0)])
+def test_solve_uses_task_timeout_unless_explicitly_capped(tmp_path, monkeypatch, cap, expected):
+    agent, _, sandbox, _ = make_agent(tmp_path, monkeypatch, toml=TASK_TOML.replace("120.0", "7200.0"))
+    if cap is not None:
+        agent.config.max_solve_timeout_s = cap
+    client = TestClient(agent.setup_webserver())
+    assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
+    assert client.post("/v1/responses", json=RESPONSES_BODY).status_code == 200
+    assert next(call for call in sandbox.execs if "solve.sh" in call["command"])["timeout_s"] == expected
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_solution_resolves_host_environment_before_execution(tmp_path, monkeypatch, present):
+    monkeypatch.delenv("ORACLE_TEST_GREETING", raising=False)
+    if present:
+        monkeypatch.setenv("ORACLE_TEST_GREETING", "from host")
+    agent, _, sandbox, _ = make_agent(
+        tmp_path, monkeypatch, toml=TASK_TOML.replace('GREETING = "hi"', 'GREETING = "${ORACLE_TEST_GREETING}"')
+    )
+    client = TestClient(agent.setup_webserver())
+    assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
+    response = client.post("/v1/responses", json=RESPONSES_BODY)
+    if present:
+        assert response.status_code == 200
+        env = next(call for call in sandbox.execs if "solve.sh" in call["command"])["env"]
+        assert env == {"DEBIAN_FRONTEND": "noninteractive", "GREETING": "from host"}
+    else:
+        assert response.status_code == 422
+        assert "ORACLE_TEST_GREETING" in response.text
+        assert not sandbox.execs and not sandbox.uploads
+
+
+def test_task_hashing_runs_outside_the_request_event_loop(tmp_path, monkeypatch):
+    import asyncio
+
+    agent, _, _, _ = make_agent(tmp_path, monkeypatch)
+    original_load = module.load_task
+    loads = []
+
+    def load_without_event_loop(path):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        loads.append(path)
+        return original_load(path)
+
+    monkeypatch.setattr(module, "load_task", load_without_event_loop)
+    client = TestClient(agent.setup_webserver())
+    assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
+    assert client.post("/v1/responses", json=RESPONSES_BODY).status_code == 200
+    assert len(loads) == 1
+
+
+def test_transient_disconnect_is_retried_by_base_session_lifecycle(tmp_path, monkeypatch):
+    agent, _, sandbox, _ = make_agent(tmp_path, monkeypatch)
+    attempts = []
+
+    async def disconnect():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("transient disconnect")
+        sandbox.disconnected = True
+
+    monkeypatch.setattr(sandbox, "disconnect", disconnect)
+    client = TestClient(agent.setup_webserver(), raise_server_exceptions=False)
+    assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
+    body = {"agent_session_id": "ag-1", "episode_id": {"rollout_id": "r1", "attempt": 0}}
+    assert client.post("/v1/agent_sessions/close", json=body).status_code == 500
+    assert client.post("/v1/agent_sessions/close", json=body).status_code == 200
+    assert len(attempts) == 2 and sandbox.disconnected

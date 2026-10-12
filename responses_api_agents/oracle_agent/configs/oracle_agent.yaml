@@ -7,5 +7,5 @@ oracle_agent:
       resources_server:
         type: resources_servers
         name: ???
-      max_solve_timeout_s: 3600
+      max_solve_timeout_s: null
       output_tail_chars: 4000

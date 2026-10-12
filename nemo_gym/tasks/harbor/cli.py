@@ -16,8 +16,9 @@ selected agent, environment server and model configs.
 import argparse
 import json
 import logging
+import math
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +56,6 @@ IN_SANDBOX_AGENTS = frozenset(
         "miniswe_sandboxed_agent",
         "opencode_sandboxed_agent",
         "pi_sandboxed_agent",
-        "terminus_2_sandboxed_agent",
     }
 )
 USE_ABSOLUTE_IP_KEY = "use_absolute_ip"
@@ -207,6 +207,10 @@ def build_run(
         agent_impl=agent.impl_name,
         agent_overrides=AGENT_OVERRIDES.get(agent.impl_name),
     )
+    # Defaults belong below explicit config files and command-line overrides.
+    config["output_jsonl_fpath"] = str(prepared.output_dir / "rollouts.jsonl")
+    if agent.runs_in_sandbox:
+        config[USE_ABSOLUTE_IP_KEY] = True
     config_path = prepared.output_dir / "run_config.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
 
@@ -223,18 +227,6 @@ def build_run(
     tokens += [token for token in overrides if not token.startswith("+agent_name=")]
     if not _has_override(tokens, "split"):
         tokens.append("+split=validation")
-    if not _has_override(tokens, "output_jsonl_fpath"):
-        tokens.append(
-            f"+output_jsonl_fpath={json.dumps(str(prepared.output_dir / 'rollouts.jsonl'), ensure_ascii=False)}"
-        )
-    if agent.runs_in_sandbox and not _has_override(tokens, USE_ABSOLUTE_IP_KEY):
-        tokens.append(f"+{USE_ABSOLUTE_IP_KEY}=true")
-        logger.info(
-            "Setting %s=true: the %s harness calls the model server from inside the sandbox, "
-            "where a loopback address is the container itself",
-            USE_ABSOLUTE_IP_KEY,
-            agent.impl_name,
-        )
     return config_path, tokens
 
 
@@ -274,24 +266,43 @@ def run_target(args: argparse.Namespace, overrides: list[str]) -> None:
 
 def validate_target(args: argparse.Namespace, overrides: list[str]) -> None:
     """Entry point for ``gym dataset validate <target>``: run every task's reference solution and score it."""
-    from nemo_gym.cli.main import _merge_config_paths, dispatch
+    from omegaconf import OmegaConf
 
-    prepared = prepare_target(args.target)
-    agent = resolve_agent(ORACLE_AGENT)
+    from nemo_gym.cli.main import _merge_config_paths, dispatch
+    from nemo_gym.global_config import get_global_config_dict
+    from nemo_gym.rollout_collection import RolloutCollectionConfig, RolloutCollectionHelper
+
+    # Evaluation and reference validation must never share inputs, configs, or cached results.
+    try:
+        agent = resolve_agent(ORACLE_AGENT)
+        sandbox = getattr(args, "sandbox", None)
+        if sandbox is not None:
+            resolve_sandbox_config(sandbox)
+        prepared = prepare_target(args.target, output_root=DEFAULT_OUTPUT_ROOT / "validation")
+    except (HarborTaskError, HubError, ValueError, OSError, yaml.YAMLError) as exc:
+        args._parser.error(str(exc))
     unvalidated = [task.task_id for task in prepared.tasks if not task.has_solution]
-    if len(unvalidated) == len(prepared.tasks):
-        print(f"No task in {prepared.folder} has solution/solve.sh; nothing to validate.")
-        return
-    tokens = list(overrides)
-    if not any(token.startswith("+config_paths=") and "responses_api_models/" in token for token in tokens):
-        tokens += [f"+config_paths=[{_config_path(PLACEHOLDER_MODEL_CONFIG)}]", *PLACEHOLDER_MODEL_OVERRIDES]
-    config_path, tokens = build_run(prepared, agent, sandbox=getattr(args, "sandbox", None), overrides=tokens)
-    print(
-        f"Run config written to {config_path}; validating {len(prepared.tasks) - len(unvalidated)} task(s) with the oracle"
-    )
-    dispatch("nemo_gym.cli.eval:e2e_rollout_collection", _merge_config_paths(tokens))
+    prepared = replace(prepared, tasks=[task for task in prepared.tasks if task.has_solution])
+    write_rows(prepared.tasks, prepared.taskset, prepared.rows_path)
     rollouts = prepared.output_dir / "rollouts.jsonl"
-    report = summarize_validation(rollouts, unvalidated)
+    expected = []
+    if prepared.tasks:
+        tokens = list(overrides)
+        if not any(token.startswith("+config_paths=") and "responses_api_models/" in token for token in tokens):
+            tokens += [f"+config_paths=[{_config_path(PLACEHOLDER_MODEL_CONFIG)}]", *PLACEHOLDER_MODEL_OVERRIDES]
+        config_path, tokens = build_run(prepared, agent, sandbox=sandbox, overrides=tokens)
+        tokens = _merge_config_paths(tokens)
+        # Resolve through the same parser and cache used by dispatch, including file overlays.
+        sys.argv = [sys.argv[0], *tokens]
+        config = get_global_config_dict()
+        collection = RolloutCollectionConfig.model_validate(
+            {**OmegaConf.to_container(config, resolve=True), "input_jsonl_fpath": str(prepared.rows_path)}
+        )
+        expected = RolloutCollectionHelper()._preprocess_rows_from_config(collection)
+        rollouts = Path(collection.output_jsonl_fpath)
+        print(f"Run config written to {config_path}; validating {len(expected)} oracle rollout(s)")
+        dispatch("nemo_gym.cli.eval:e2e_rollout_collection", tokens)
+    report = summarize_validation(rollouts, unvalidated, expected=expected, skipped=prepared.skipped)
     print(report.text)
     if not report.ok:
         sys.exit(1)
@@ -316,47 +327,74 @@ def _task_name(row: dict[str, Any]) -> str:
     return str(identity.get("task_id", "?")) if isinstance(identity, dict) else str(identity)
 
 
-def summarize_validation(rollouts: Path, unvalidated: list[str]) -> ValidationReport:
-    """One line per task: the oracle's reward, or why there is none.
+def _validation_key(row: dict[str, object]) -> tuple[str, str, object, object]:
+    identity = row.get("_ng_task_id") or row.get("task_id") or {}
+    taskset = str(identity.get("taskset", "")) if isinstance(identity, dict) else ""
+    return taskset, _task_name(row), row.get("_ng_task_index"), row.get("_ng_rollout_index")
 
-    Rollout collection stores an environment server's result as returned, so a row is the verify
-    response itself (``reward``, ``mask_sample``, ``failure_kind``, ``response``) plus ``_ng_task_id``.
-    Episodes that failed before verification are in the failures sidecar next to the rollouts file.
+
+def _validation_rows(path: Path) -> list[dict[str, object]]:
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def summarize_validation(
+    rollouts: Path,
+    unvalidated: list[str],
+    *,
+    expected: list[dict[str, object]] | None = None,
+    skipped: dict[str, str] | None = None,
+) -> ValidationReport:
+    """Report every selected task/repeat, reconciling results with failed attempts.
+
+    The collector stores verify responses directly and keeps historical failed attempts in a
+    sidecar. A result supersedes failures for the same task/repeat, but never another repeat.
+    ``expected`` contains the collector's selected, expanded input rows (after limit/repeats).
     """
     lines = ["task_id\tstatus\treward"]
     ok = True
-    if rollouts.is_file():
-        for raw in rollouts.read_text().splitlines():
-            if not raw.strip():
-                continue
-            row = json.loads(raw)
-            task_id = _task_name(row)
-            oracle = _dig(row, "response", "metadata", "oracle")
-            reward = row.get("reward")
-            if row.get("mask_sample"):
-                ok = False
-                lines.append(f"{task_id}\tmasked ({row.get('failure_kind')})\t-")
-            elif oracle == "unvalidated":
-                lines.append(f"{task_id}\tunvalidated (no solution/)\t-")
+    selected = {_validation_key(row): row for row in expected} if expected is not None else None
+    results = {_validation_key(row): row for row in _validation_rows(rollouts)}
+    failures = {_validation_key(row): row for row in _validation_rows(failures_path_for(rollouts))}
+    keys = selected if selected is not None else dict.fromkeys([*results, *failures])
+    for key in keys:
+        _, task_id, _, repeat = key
+        label = f"{task_id} [repeat {repeat}]" if repeat is not None else task_id
+        if task_id in unvalidated:
+            continue
+        row = results.get(key)
+        if row is None:
+            ok = False
+            failure = failures.get(key)
+            if failure is None:
+                lines.append(f"{label}\tmissing result\t-")
             else:
-                if reward is None or reward < 1.0:
-                    ok = False
-                kind = row.get("failure_kind")
-                note = f" ({kind})" if kind else ""
-                lines.append(f"{task_id}\toracle {oracle or 'ran'}{note}\t{reward}")
-        failures = failures_path_for(rollouts)
-        if failures.is_file():
-            for raw in failures.read_text().splitlines():
-                if not raw.strip():
-                    continue
-                row = json.loads(raw)
+                message = failure.get("_ng_failure_message") or failure.get("_ng_failure_class") or "failed"
+                lines.append(f"{label}\tfailed: {str(message)[:120]}\t-")
+            continue
+        oracle = _dig(row, "response", "metadata", "oracle")
+        reward = row.get("reward")
+        if row.get("mask_sample"):
+            ok = False
+            lines.append(f"{label}\tmasked ({row.get('failure_kind')})\t-")
+        elif oracle == "unvalidated":
+            # A selected reference solution disappearing is not a successful validation.
+            if selected is not None:
                 ok = False
-                message = row.get("_ng_failure_message") or row.get("_ng_failure_class") or "failed"
-                lines.append(f"{_task_name(row)}\tfailed: {str(message)[:120]}\t-")
-    else:
+            lines.append(f"{label}\tunvalidated (no solution/)\t-")
+        else:
+            if oracle == "failed" or not isinstance(reward, (int, float)) or not math.isfinite(reward) or reward < 1.0:
+                ok = False
+            kind = row.get("failure_kind")
+            note = f" ({kind})" if kind else ""
+            lines.append(f"{label}\toracle {oracle or 'ran'}{note}\t{reward}")
+    if selected is None and not rollouts.is_file():
         ok = False
         lines.append(f"-\tno rollouts written at {rollouts}\t-")
     for task_id in unvalidated:
-        if not any(line.startswith(f"{task_id}\t") for line in lines):
-            lines.append(f"{task_id}\tunvalidated (no solution/)\t-")
+        lines.append(f"{task_id}\tunvalidated (no solution/)\t-")
+    for task_id, reason in (skipped or {}).items():
+        ok = False
+        lines.append(f"{task_id}\tskipped: {reason}\t-")
     return ValidationReport(text="\n".join(lines), ok=ok)
