@@ -117,6 +117,26 @@ def test_validate_reads_effective_output_and_preserves_evaluation_artifacts(
     assert (tmp_path / "results/harbor/validation/ds/run_config.yaml").is_file()
 
 
+@pytest.mark.parametrize("oracle_status", ["solved", "failed"])
+def test_validate_requires_solution_success_even_when_verifier_passes(
+    tmp_path, monkeypatch, validation_cli, capsys, oracle_status
+):
+    write_task(tmp_path / "ds" / "a")
+
+    def collect(target, tokens):
+        config = global_config.get_global_config_dict()
+        write_jsonl(Path(config.output_jsonl_fpath), [result(response={"metadata": {"oracle": oracle_status}})])
+
+    monkeypatch.setattr(main_module, "dispatch", collect)
+    if oracle_status == "failed":
+        with pytest.raises(SystemExit) as exc:
+            validation_cli()
+        assert exc.value.code == 1
+    else:
+        validation_cli()
+    assert f"oracle {oracle_status}\t1.0" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("missing_repeat", [False, True])
 def test_validate_filters_solutionless_before_limit_and_checks_repeats(
     tmp_path, monkeypatch, capsys, validation_cli, missing_repeat

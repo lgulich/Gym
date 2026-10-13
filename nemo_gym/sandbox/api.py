@@ -557,9 +557,10 @@ class AsyncSandbox:
                 self._require_handle(),
                 command,
                 cwd=cwd if cwd is not None else self._spec.workdir if self._spec is not None else None,
-                env=env,
                 timeout_s=timeout_s,
-                user=user,
+                # Older custom providers implement only cwd and timeout_s.
+                **({"env": env} if env is not None else {}),
+                **({"user": user} if user is not None else {}),
             )
         return await self._provider.exec(
             self._require_handle(),
