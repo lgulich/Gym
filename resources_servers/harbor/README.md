@@ -51,10 +51,12 @@ preserved during extraction.
 ## Configuration and artifacts
 
 See [`configs/harbor.yaml`](configs/harbor.yaml) for this layer's supported settings. Verifier logs default
-to `${results_dir}/harbor/verifier/<resources_session_id>`, using Gym's absolute results root. An explicit
-relative `artifacts_dir` is relative to that root; an absolute path is used directly. Responses always
-include an absolute `verifier_logs_dir` naming the collection location; that directory can be empty
-if optional log collection fails.
+to `${results_dir}/harbor/verifier/<generated-directory>`, using Gym's absolute results root. An explicit
+relative `artifacts_dir` is relative to that root; an absolute path is used directly. The server reserves
+a fresh directory for each verification; caller-assigned session IDs are never used as host paths.
+Retries return the same directory with the cached result. Measured outcomes include an absolute
+`verifier_logs_dir` naming the collection location; that directory can be empty if optional log
+collection fails.
 
 Hermes honors the task's `[agent].timeout_sec` via the materialized `agent_timeout_sec` metadata,
 using the smaller of that deadline and its configured runner limit. The verifier uses

@@ -479,7 +479,7 @@ class HarborResourcesServer(SimpleResourcesServer):
                 raise HTTPException(*session.verify_error)
             if session.verify_outcome is None:
                 try:
-                    session.verify_outcome = await self._run_verifier(session, session_id)
+                    session.verify_outcome = await self._run_verifier(session)
                 except HTTPException as exc:
                     # Cache only the error data, not a traceback retaining request/sandbox state.
                     session.verify_error = (exc.status_code, str(exc.detail))
@@ -491,13 +491,20 @@ class HarborResourcesServer(SimpleResourcesServer):
             **outcome,
         )
 
-    async def _run_verifier(self, session: HarborSession, session_id: str) -> dict[str, Any]:
+    async def _run_verifier(self, session: HarborSession) -> dict[str, Any]:
         """Run ``tests/test.sh`` in the agent's sandbox and read the reward it wrote."""
         task = session.task
         sandbox = session.sandbox
         settings = task.config.verifier
-        logs_dir = self._artifacts_dir / session_id
         try:
+            # Protocol IDs are opaque caller input, never host paths. Reserve a fresh directory
+            # so neither traversal nor stale output from a reused ID can supply verifier files.
+            if self._artifacts_dir.resolve() != self._artifacts_dir:
+                raise RuntimeError("Verifier artifact root was redirected after server startup")
+            self._artifacts_dir.mkdir(parents=True, exist_ok=True)
+            logs_dir = Path(tempfile.mkdtemp(prefix="session-", dir=self._artifacts_dir)).resolve()
+            if not logs_dir.is_relative_to(self._artifacts_dir):
+                raise RuntimeError("Verifier log directory escapes the configured artifact root")
             # Replace agent-planted directory links before cleanup: find does not follow its starting
             # symlink, while tar does. Unlink /logs first without touching its former target.
             roots = (str(Path(VERIFIER_LOGS_DIR).parent), TESTS_DIR, VERIFIER_LOGS_DIR, AGENT_LOGS_DIR)
