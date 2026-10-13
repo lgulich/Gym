@@ -63,6 +63,7 @@ def test_templates_resolve_at_use_without_changing_materialized_task(tmp_path, m
         + '\n[environment.env]\nTOKEN = "${HARBOR_TEST_TOKEN}"\n[verifier.env]\nTOKEN = "${HARBOR_TEST_TOKEN}"\n'
     )
     server, task, sandbox, _ = make_server(tmp_path, monkeypatch, toml=toml)
+    server.config.derive_cpu_env = False  # keep the spec env to the task's own entries
     monkeypatch.setattr(
         "resources_servers.harbor.app.get_global_config_dict", lambda: {"sandbox": {"opensandbox": {}}}
     )
@@ -232,7 +233,7 @@ async def test_close_waits_for_seed_and_keeps_single_lock(tmp_path, monkeypatch)
     async def prepare(*args):
         entered.set()
         await release.wait()
-        await original(*args)
+        return await original(*args)
 
     monkeypatch.setattr(server, "_prepare_workdir", prepare)
     seed = asyncio.create_task(server.seed_session(request(), ResourcesSeedSessionRequest(**seed_body(task))))
