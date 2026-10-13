@@ -34,6 +34,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Literal
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -502,9 +503,19 @@ class HarborResourcesServer(SimpleResourcesServer):
             if self._artifacts_dir.resolve() != self._artifacts_dir:
                 raise RuntimeError("Verifier artifact root was redirected after server startup")
             self._artifacts_dir.mkdir(parents=True, exist_ok=True)
-            logs_dir = Path(tempfile.mkdtemp(prefix="session-", dir=self._artifacts_dir)).resolve()
+            logs_dir = self._artifacts_dir / f"session-{uuid4().hex}"
+            # Exclusive mkdir keeps the directory fresh while honoring the process umask and parent ACLs.
+            logs_dir.mkdir()
+            logs_dir = logs_dir.resolve()
             if not logs_dir.is_relative_to(self._artifacts_dir):
                 raise RuntimeError("Verifier log directory escapes the configured artifact root")
+        except (OSError, RuntimeError) as exc:
+            LOGGER.exception("Could not create verifier logs under %s", self._artifacts_dir)
+            return self._masked(
+                failure_kinds.PERSISTENCE_FAILED,
+                f"Could not create verifier logs under {self._artifacts_dir}: {type(exc).__name__}: {exc}",
+            )
+        try:
             # Replace agent-planted directory links before cleanup: find does not follow its starting
             # symlink, while tar does. Unlink /logs first without touching its former target.
             roots = (str(Path(VERIFIER_LOGS_DIR).parent), TESTS_DIR, VERIFIER_LOGS_DIR, AGENT_LOGS_DIR)

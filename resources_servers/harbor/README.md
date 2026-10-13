@@ -54,6 +54,9 @@ See [`configs/harbor.yaml`](configs/harbor.yaml) for this layer's supported sett
 to `${results_dir}/harbor/verifier/<generated-directory>`, using Gym's absolute results root. An explicit
 relative `artifacts_dir` is relative to that root; an absolute path is used directly. The server reserves
 a fresh directory for each verification; caller-assigned session IDs are never used as host paths.
+New directories honor the server process's umask and inherited directory permissions, including group
+access for shared results. Local log-directory creation or containment failures exclude the sample
+with `failure_kind: persistence_failed` and identify the affected path.
 Retries return the same directory with the cached result. Measured outcomes include an absolute
 `verifier_logs_dir` naming the collection location; that directory can be empty if optional log
 collection fails.
