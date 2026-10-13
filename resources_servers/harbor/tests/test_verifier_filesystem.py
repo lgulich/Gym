@@ -79,7 +79,7 @@ async def test_linked_verifier_roots_cannot_preserve_planted_success(tmp_path, m
         f"  bash {shlex.quote(str(tests / 'helper.sh'))}\nelse\n  echo 0\nfi "
         f"> {shlex.quote(str(logs / 'verifier' / 'reward.txt'))}\n"
     )
-    outcome = await server._run_verifier(SimpleNamespace(task=task, sandbox=LocalSandbox(), workdir=str(root)), linked)
+    outcome = await server._run_verifier(SimpleNamespace(task=task, sandbox=LocalSandbox(), workdir=str(root)))
     assert outcome["reward"] == 0
     assert not outcome.get("mask_sample", False)
     assert not tests.is_symlink() and not logs.is_symlink() and not (logs / "verifier").is_symlink()
@@ -115,7 +115,7 @@ async def test_unsafe_diagnostic_link_does_not_mask_valid_reward(tmp_path, monke
         f"ln -s {shlex.quote(str(outside))} {shlex.quote(str(logs / 'verifier/diagnostic-link'))}\n"
         "echo useful-output\n"
     )
-    outcome = await server._run_verifier(SimpleNamespace(task=task, sandbox=LocalSandbox(), workdir=str(root)), "logs")
+    outcome = await server._run_verifier(SimpleNamespace(task=task, sandbox=LocalSandbox(), workdir=str(root)))
     assert outcome["reward"] == 1 and not outcome.get("mask_sample", False)
     artifacts = Path(outcome["verifier_logs_dir"])
     assert not (artifacts / "diagnostic-link").exists()
@@ -162,7 +162,7 @@ async def test_optional_diagnostic_transfer_failure_preserves_score(tmp_path, mo
         await download(source, target)
 
     monkeypatch.setattr(sandbox, "download", fail_diagnostics)
-    outcome = await server._run_verifier(SimpleNamespace(task=task, sandbox=sandbox, workdir="/app"), "diagnostics")
+    outcome = await server._run_verifier(SimpleNamespace(task=task, sandbox=sandbox, workdir="/app"))
     assert calls == 2
     assert outcome["reward"] == 1 and not outcome.get("mask_sample", False)
     await server.shutdown()
@@ -178,9 +178,72 @@ async def test_unsafe_reward_link_still_masks_transfer_failure(tmp_path, monkeyp
     (task.path / "tests/test.sh").write_text(
         f"ln -s {shlex.quote(str(outside))} {shlex.quote(str(logs / 'verifier/reward.txt'))}\n"
     )
-    outcome = await server._run_verifier(
-        SimpleNamespace(task=task, sandbox=LocalSandbox(), workdir=str(root)), "reward"
-    )
+    outcome = await server._run_verifier(SimpleNamespace(task=task, sandbox=LocalSandbox(), workdir=str(root)))
     assert outcome["reward"] == 0 and outcome["mask_sample"] is True
-    assert not (server._artifacts_dir / "reward/reward.txt").exists()
+    assert not list(server._artifacts_dir.rglob("reward.txt"))
     await server.shutdown()
+
+
+@pytest.mark.parametrize(
+    "identifier", ["normal", "absolute", "traversal", "dot", "parent", "nested", "unicode", "long"]
+)
+def test_opaque_session_ids_keep_verifier_files_inside_artifact_root(tmp_path, monkeypatch, identifier):
+    server, task, sandbox, _ = make_server(tmp_path, monkeypatch)
+    root = tmp_path / "work" / "artifacts"
+    server._artifacts_dir = root
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "reward.txt"
+    sentinel.write_text("untouched")
+    session_id = {
+        "normal": "rs-1",
+        "absolute": str(outside),
+        "traversal": "../../outside",
+        "dot": ".",
+        "parent": "..",
+        "nested": "nested/session",
+        "unicode": "会话/任务",
+        "long": "x" * 300,
+    }[identifier]
+    with TestClient(server.setup_webserver()) as client:
+        seeded = client.post("/seed_session", json=seed_body(task, session=session_id))
+        assert seeded.status_code == 200 and seeded.json()["resources_session_id"] == session_id
+        first = client.post("/verify", json=verify_body())
+        assert first.status_code == 200 and first.json()["reward"] == 1
+        assert first.json()["mask_sample"] is False
+        logs = Path(first.json()["verifier_logs_dir"]).resolve()
+        assert logs.parent == root.resolve()
+        assert (logs / "reward.txt").read_text() == "1\n"
+        assert sentinel.read_text() == "untouched"
+        assert not (outside / "test-stdout.txt").exists()
+        assert client.post("/verify", json=verify_body()).json() == first.json()
+        assert sum("test.sh" in call["command"] for call in sandbox.execs) == 1
+
+
+def test_artifact_root_redirected_after_startup_cannot_receive_verifier_files(tmp_path, monkeypatch):
+    server, task, sandbox, _ = make_server(tmp_path, monkeypatch)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with TestClient(server.setup_webserver()) as client:
+        assert client.post("/seed_session", json=seed_body(task)).status_code == 200
+        server._artifacts_dir.symlink_to(outside, target_is_directory=True)
+        response = client.post("/verify", json=verify_body())
+        assert response.status_code == 200
+        assert response.json()["mask_sample"] is True
+        assert list(outside.iterdir()) == []
+        assert not any("test.sh" in call["command"] for call in sandbox.execs)
+
+
+def test_reused_protocol_id_does_not_read_old_verifier_output(tmp_path, monkeypatch):
+    sandbox = FakeSandbox(verifier_files={"test-stdout.txt": "no reward was written"})
+    server, task, _, _ = make_server(tmp_path, monkeypatch, sandbox)
+    stale = server._artifacts_dir / "rs-1"
+    stale.mkdir(parents=True)
+    (stale / "reward.json").write_text('{"reward": 1}')
+    with TestClient(server.setup_webserver()) as client:
+        assert client.post("/seed_session", json=seed_body(task)).status_code == 200
+        response = client.post("/verify", json=verify_body()).json()
+        assert response["reward"] == 0 and response["mask_sample"] is False
+        assert response["failure_kind"] == "harbor:missing_reward"
+        assert Path(response["verifier_logs_dir"]) != stale
+        assert (stale / "reward.json").read_text() == '{"reward": 1}'

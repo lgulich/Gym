@@ -287,8 +287,8 @@ def test_logs_use_global_results_root_across_working_directories(tmp_path, monke
     client = TestClient(server.setup_webserver())
     assert client.post("/seed_session", json=seed_body(task)).status_code == 200
     payload = client.post("/verify", json=verify_body()).json()
-    expected = results / (artifacts or "harbor/verifier") / "rs-1"
-    assert Path(payload["verifier_logs_dir"]) == expected
+    expected = results / (artifacts or "harbor/verifier")
+    assert Path(payload["verifier_logs_dir"]).parent == expected
     monkeypatch.chdir(tmp_path)
     assert (Path(payload["verifier_logs_dir"]) / "reward.txt").read_text() == "1\n"
     assert not (component / "results").exists()
