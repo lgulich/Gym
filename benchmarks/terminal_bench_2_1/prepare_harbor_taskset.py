@@ -25,7 +25,7 @@ from resources_servers.terminal_bench_2_1.app import GOLDEN_PATCH_SOLVE_SH_PATCH
 
 REPO_URL = "https://github.com/harbor-framework/terminal-bench-2-1"
 # Upstream commit the `terminal_bench_2_1` server was baselined against.
-PINNED_COMMIT = "7131e4375048a0e408a8fb404b5f499d726b695b"
+PINNED_COMMIT = "7131e4375048a0e408a8fb404b5f499d726b695b"  # pragma: allowlist secret
 TASKSET = "terminal-bench-2-1"
 
 
