@@ -51,8 +51,19 @@ class FakeSandbox:
     uploads: list[str] = field(default_factory=list)
     disconnected: bool = False
 
-    async def exec(self, command, *, cwd=None, env=None, timeout_s=None, user=None):
-        self.execs.append({"command": command, "cwd": cwd, "env": env, "timeout_s": timeout_s, "user": user})
+    async def exec(
+        self, command, *, cwd=None, env=None, timeout_s=None, user=None, preserve_background_services=False
+    ):
+        self.execs.append(
+            {
+                "command": command,
+                "cwd": cwd,
+                "env": env,
+                "timeout_s": timeout_s,
+                "user": user,
+                "preserve_background_services": preserve_background_services,
+            }
+        )
         if "solve.sh" in command:
             return self.result
         return SandboxExecResult(stdout="", stderr="", return_code=0)
@@ -144,6 +155,7 @@ def test_oracle_runs_solution_in_borrowed_sandbox(tmp_path, monkeypatch):
         "env": {"DEBIAN_FRONTEND": "noninteractive", "GREETING": "hi"},
         "timeout_s": 120.0,
         "user": "runner",
+        "preserve_background_services": True,
     }
 
     close = client.post(

@@ -39,13 +39,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_OUTPUT_ROOT = Path("results/harbor")
 ENVIRONMENT_SERVER_CONFIG = "environment_servers/single_agent_turn/configs/single_agent_turn.yaml"
 RESOURCES_SERVER_CONFIG = "resources_servers/harbor/configs/harbor.yaml"
-# The oracle needs no model, but a run needs a policy model block; this one is never called.
-PLACEHOLDER_MODEL_CONFIG = "responses_api_models/openai_model/configs/openai_model.yaml"
-PLACEHOLDER_MODEL_DEFAULTS = {
-    "policy_base_url": "http://oracle.invalid/v1",
-    "policy_api_key": "unused",
-    "policy_model_name": "oracle",
-}
 ORACLE_AGENT = "oracle_agent"
 # Harnesses that call the Gym model server from inside the task sandbox, where 127.0.0.1 is the container
 # itself. The model server must advertise the node's IP (`use_absolute_ip`) for them. An agent whose config
@@ -271,9 +264,10 @@ def run_target(args: argparse.Namespace, overrides: list[str]) -> None:
 def validate_target(args: argparse.Namespace, overrides: list[str]) -> None:
     """Entry point for ``gym dataset validate <target>``: run every task's reference solution and score it."""
     from omegaconf import OmegaConf
+    from omegaconf.errors import InterpolationResolutionError
 
     from nemo_gym.cli.main import _merge_config_paths, dispatch
-    from nemo_gym.global_config import get_global_config_dict
+    from nemo_gym.global_config import get_global_config_dict, translate_interpolation_error
     from nemo_gym.rollout_collection import RolloutCollectionConfig, RolloutCollectionHelper
 
     # Evaluation and reference validation must never share inputs, configs, or cached results.
@@ -291,27 +285,17 @@ def validate_target(args: argparse.Namespace, overrides: list[str]) -> None:
     rollouts = prepared.output_dir / "rollouts.jsonl"
     expected = []
     if prepared.tasks:
-        tokens = list(overrides)
-        if not any(token.startswith("+config_paths=") and "responses_api_models/" in token for token in tokens):
-            # Keep the unused model's defaults below every explicit file and CLI setting.
-            placeholder_path = prepared.output_dir / "oracle_model.yaml"
-            placeholder_path.write_text(
-                yaml.safe_dump(
-                    {
-                        **PLACEHOLDER_MODEL_DEFAULTS,
-                        **yaml.safe_load(_config_path(PLACEHOLDER_MODEL_CONFIG).read_text()),
-                    }
-                )
-            )
-            tokens.insert(0, f"+config_paths=[{json.dumps(str(placeholder_path.resolve()))}]")
-        config_path, tokens = build_run(prepared, agent, sandbox=sandbox, overrides=tokens)
+        # Oracle runs reference scripts directly; it needs no placeholder model server.
+        config_path, tokens = build_run(prepared, agent, sandbox=sandbox, overrides=list(overrides))
         tokens = _merge_config_paths(tokens)
         # Resolve through the same parser and cache used by dispatch, including file overlays.
         sys.argv = [sys.argv[0], *tokens]
         config = get_global_config_dict()
-        collection = RolloutCollectionConfig.model_validate(
-            {**OmegaConf.to_container(config, resolve=True), "input_jsonl_fpath": str(prepared.rows_path)}
-        )
+        try:
+            resolved = OmegaConf.to_container(config, resolve=True)
+        except InterpolationResolutionError as exc:
+            raise translate_interpolation_error(exc) from exc
+        collection = RolloutCollectionConfig.model_validate({**resolved, "input_jsonl_fpath": str(prepared.rows_path)})
         expected = RolloutCollectionHelper()._preprocess_rows_from_config(collection)
         rollouts = Path(collection.output_jsonl_fpath)
         if collection.resume_from_cache and rollouts.is_file() and collection.materialized_jsonl_fpath.is_file():
