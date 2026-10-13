@@ -199,4 +199,115 @@ def test_network_default_is_below_explicit_config_and_cli(tmp_path, monkeypatch,
     )
     monkeypatch.setattr(sys, "argv", ["e2e", *_merge_config_paths(tokens)])
     monkeypatch.setattr(global_config, "_GLOBAL_CONFIG_DICT", None)
+    monkeypatch.setattr(global_config, "gethostbyname", lambda _: "192.0.2.20")
     assert global_config.get_global_config_dict().use_absolute_ip is cli_override
+
+
+@pytest.mark.parametrize("source", ["cli", "file", "partial"])
+def test_placeholder_model_defaults_preserve_explicit_settings(tmp_path, monkeypatch, validation_cli, source):
+    write_task(tmp_path / "ds" / "a")
+    settings = {
+        "policy_base_url": "http://127.0.0.1:8123/v1",
+        "policy_model_name": "existing",
+        "policy_api_key": "unused",
+    }
+    if source == "partial":
+        settings = {"policy_model_name": "existing"}
+    if source == "file":
+        overlay = tmp_path / "model settings.yaml"
+        overlay.write_text(yaml.safe_dump(settings))
+        flags = ["--config", str(overlay)]
+    else:
+        flags = [f"+{key}={value}" for key, value in settings.items()]
+
+    def collect(target, tokens):
+        config = global_config.get_global_config_dict()
+        model = config.policy_model.responses_api_models.openai_model
+        assert model.openai_model == "existing"
+        assert model.openai_base_url == settings.get("policy_base_url", "http://oracle.invalid/v1")
+        assert model.openai_api_key == "unused"
+        write_jsonl(Path(config.output_jsonl_fpath), [result()])
+
+    monkeypatch.setattr(main_module, "dispatch", collect)
+    validation_cli(*flags)
+
+
+def test_validate_reports_preflight_config_errors_cleanly(tmp_path, monkeypatch, validation_cli, capsys):
+    write_task(tmp_path / "ds" / "a")
+    monkeypatch.setattr(main_module, "dispatch", lambda *args: pytest.fail("invalid config must not dispatch"))
+    with pytest.raises(SystemExit) as exc:
+        validation_cli("--model-type", "vllm_model")
+    assert exc.value.code == 1
+    output = capsys.readouterr()
+    assert "Error:" in output.out and "policy_base_url" in output.out
+    assert "Traceback" not in output.out + output.err
+
+
+def test_validate_resume_rejects_changed_digest_and_preserves_unchanged_retries(
+    tmp_path, monkeypatch, validation_cli, capsys
+):
+    """Real CLI, preparation and collector; replace only server startup and rollout execution."""
+    from types import SimpleNamespace
+
+    from nemo_gym.cli.eval import RunHelper
+    from nemo_gym.path_utils import materialized_path_for
+    from nemo_gym.rollout_collection import RolloutCollectionHelper, _CompletedRollout
+
+    task = write_task(tmp_path / "ds" / "a")
+    dispatched = []
+    first_attempt = True
+
+    async def complete(row):
+        dispatched.append(row)
+        if first_attempt:
+            payload = result(_ng_failure_class="agent_request_failed", _ng_failure_message="temporary failure")
+        elif "exit 99" in (task / "solution/solve.sh").read_text():
+            payload = result(reward=0.0, response={"metadata": {"oracle": "failed"}})
+        else:
+            payload = result(response={"metadata": {"oracle": "solved"}})
+        return _CompletedRollout(row=row, result=payload, rollout_latency_ms=1.0)
+
+    monkeypatch.setattr(RunHelper, "start", lambda *args: None)
+    monkeypatch.setattr(RunHelper, "shutdown", lambda *args: None)
+    monkeypatch.setattr(
+        RolloutCollectionHelper,
+        "setup_server_client",
+        lambda *args: SimpleNamespace(global_config_dict=global_config.get_global_config_dict()),
+    )
+    monkeypatch.setattr(
+        RolloutCollectionHelper,
+        "_run_examples_with_metadata",
+        lambda self, rows, **kwargs: (complete(row) for row in rows),
+    )
+
+    def invoke(*flags):
+        monkeypatch.setattr(global_config, "_GLOBAL_CONFIG_DICT", None)
+        validation_cli("+disable_aggregation=true", "+resume_from_cache=true", *flags)
+
+    with pytest.raises(RuntimeError, match="None of the 1 dispatched rollouts produced a result"):
+        invoke()
+    first_attempt = False
+    invoke()
+    assert len(dispatched) == 2 and dispatched[-1]["_ng_attempt_index"] == 1
+    rollouts = tmp_path / "results/harbor/validation/ds/rollouts.jsonl"
+    cached_inputs = materialized_path_for(rollouts).read_bytes()
+    cached_results = rollouts.read_bytes()
+    invoke()
+    assert len(dispatched) == 2
+
+    (task / "solution/solve.sh").write_text("#!/bin/bash\nexit 99\n")
+    with pytest.raises(SystemExit) as exc:
+        invoke()
+    assert exc.value.code == 1
+    assert len(dispatched) == 2
+    assert "task digests have changed" in capsys.readouterr().out
+    assert materialized_path_for(rollouts).read_bytes() == cached_inputs
+    assert rollouts.read_bytes() == cached_results
+
+    # An explicit fresh run replaces the stale cache and reports the new failing solution.
+    monkeypatch.setattr(global_config, "_GLOBAL_CONFIG_DICT", None)
+    with pytest.raises(SystemExit) as exc:
+        validation_cli("+disable_aggregation=true", "+resume_from_cache=false")
+    assert exc.value.code == 1 and len(dispatched) == 3
+    assert json.loads(rollouts.read_text())["reward"] == 0.0
+    assert materialized_path_for(rollouts).read_bytes() != cached_inputs

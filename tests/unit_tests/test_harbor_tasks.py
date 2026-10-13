@@ -1099,6 +1099,7 @@ def test_generated_run_passes_full_config_validation(tmp_path, monkeypatch, task
     )
     monkeypatch.setattr(sys, "argv", ["e2e", *_merge_config_paths(tokens)])
     monkeypatch.setattr(global_config, "_GLOBAL_CONFIG_DICT", None)
+    monkeypatch.setattr(global_config, "gethostbyname", lambda _: "192.0.2.20")
     config = get_global_config_dict()
     servers = GlobalConfigDictParser().filter_for_server_instance_configs(config)
     resources = next(server for server in servers if server.name == resources_server_instance(taskset))

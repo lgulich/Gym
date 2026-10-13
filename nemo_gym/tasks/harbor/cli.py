@@ -25,7 +25,10 @@ from typing import Any
 import yaml
 
 from nemo_gym import component_search_roots
+from nemo_gym.cli.utils import exit_cleanly_on_config_error
+from nemo_gym.config_types import ConfigError
 from nemo_gym.path_utils import failures_path_for
+from nemo_gym.tasks.harbor.digest import DIGEST_KEY
 from nemo_gym.tasks.harbor.hub import HubError, datasets_dir, fetch_ref, is_hub_ref
 from nemo_gym.tasks.harbor.materialize import run_config, write_rows
 from nemo_gym.tasks.harbor.task import HarborTask, HarborTaskError, discover_tasks
@@ -38,11 +41,11 @@ ENVIRONMENT_SERVER_CONFIG = "environment_servers/single_agent_turn/configs/singl
 RESOURCES_SERVER_CONFIG = "resources_servers/harbor/configs/harbor.yaml"
 # The oracle needs no model, but a run needs a policy model block; this one is never called.
 PLACEHOLDER_MODEL_CONFIG = "responses_api_models/openai_model/configs/openai_model.yaml"
-PLACEHOLDER_MODEL_OVERRIDES = [
-    "+policy_base_url=http://oracle.invalid/v1",
-    "+policy_api_key=unused",
-    "+policy_model_name=oracle",
-]
+PLACEHOLDER_MODEL_DEFAULTS = {
+    "policy_base_url": "http://oracle.invalid/v1",
+    "policy_api_key": "unused",
+    "policy_model_name": "oracle",
+}
 ORACLE_AGENT = "oracle_agent"
 # Harnesses that call the Gym model server from inside the task sandbox, where 127.0.0.1 is the container
 # itself. The model server must advertise the node's IP (`use_absolute_ip`) for them. An agent whose config
@@ -264,6 +267,7 @@ def run_target(args: argparse.Namespace, overrides: list[str]) -> None:
     dispatch("nemo_gym.cli.eval:e2e_rollout_collection", _merge_config_paths(tokens))
 
 
+@exit_cleanly_on_config_error
 def validate_target(args: argparse.Namespace, overrides: list[str]) -> None:
     """Entry point for ``gym dataset validate <target>``: run every task's reference solution and score it."""
     from omegaconf import OmegaConf
@@ -289,7 +293,17 @@ def validate_target(args: argparse.Namespace, overrides: list[str]) -> None:
     if prepared.tasks:
         tokens = list(overrides)
         if not any(token.startswith("+config_paths=") and "responses_api_models/" in token for token in tokens):
-            tokens += [f"+config_paths=[{_config_path(PLACEHOLDER_MODEL_CONFIG)}]", *PLACEHOLDER_MODEL_OVERRIDES]
+            # Keep the unused model's defaults below every explicit file and CLI setting.
+            placeholder_path = prepared.output_dir / "oracle_model.yaml"
+            placeholder_path.write_text(
+                yaml.safe_dump(
+                    {
+                        **PLACEHOLDER_MODEL_DEFAULTS,
+                        **yaml.safe_load(_config_path(PLACEHOLDER_MODEL_CONFIG).read_text()),
+                    }
+                )
+            )
+            tokens.insert(0, f"+config_paths=[{json.dumps(str(placeholder_path.resolve()))}]")
         config_path, tokens = build_run(prepared, agent, sandbox=sandbox, overrides=tokens)
         tokens = _merge_config_paths(tokens)
         # Resolve through the same parser and cache used by dispatch, including file overlays.
@@ -300,6 +314,20 @@ def validate_target(args: argparse.Namespace, overrides: list[str]) -> None:
         )
         expected = RolloutCollectionHelper()._preprocess_rows_from_config(collection)
         rollouts = Path(collection.output_jsonl_fpath)
+        if collection.resume_from_cache and rollouts.is_file() and collection.materialized_jsonl_fpath.is_file():
+            # The collector resumes its saved inputs, not the just-prepared task rows. Reject a stale
+            # selection or digest before startup so an old reward cannot validate a changed solution.
+            cached = _validation_rows(collection.materialized_jsonl_fpath)
+            current_digests = {
+                _validation_key(row): _dig(row, "task_input", "task_data", DIGEST_KEY) for row in expected
+            }
+            cached_digests = {_validation_key(row): _dig(row, "task_input", "task_data", DIGEST_KEY) for row in cached}
+            if cached_digests != current_digests:
+                raise ConfigError(
+                    f"Cannot resume Harbor validation from {collection.materialized_jsonl_fpath}: "
+                    "the selected tasks or task digests have changed. Use +resume_from_cache=false "
+                    "to validate the current tasks, or choose a new +output_jsonl_fpath to keep the old results."
+                )
         print(f"Run config written to {config_path}; validating {len(expected)} oracle rollout(s)")
         dispatch("nemo_gym.cli.eval:e2e_rollout_collection", tokens)
     report = summarize_validation(rollouts, unvalidated, expected=expected, skipped=prepared.skipped)
