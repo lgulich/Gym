@@ -203,8 +203,8 @@ def test_network_default_is_below_explicit_config_and_cli(tmp_path, monkeypatch,
     assert global_config.get_global_config_dict().use_absolute_ip is cli_override
 
 
-@pytest.mark.parametrize("source", ["cli", "file", "partial"])
-def test_placeholder_model_defaults_preserve_explicit_settings(tmp_path, monkeypatch, validation_cli, source):
+@pytest.mark.parametrize("source", ["cli", "file", "partial", "dotenv", "none"])
+def test_validate_needs_no_model_even_with_unused_endpoint_settings(tmp_path, monkeypatch, validation_cli, source):
     write_task(tmp_path / "ds" / "a")
     settings = {
         "policy_base_url": "http://127.0.0.1:8123/v1",
@@ -213,7 +213,12 @@ def test_placeholder_model_defaults_preserve_explicit_settings(tmp_path, monkeyp
     }
     if source == "partial":
         settings = {"policy_model_name": "existing"}
-    if source == "file":
+    if source == "none":
+        settings = {}
+    if source == "dotenv":
+        (tmp_path / "env.yaml").write_text(yaml.safe_dump(settings))
+        flags = []
+    elif source == "file":
         overlay = tmp_path / "model settings.yaml"
         overlay.write_text(yaml.safe_dump(settings))
         flags = ["--config", str(overlay)]
@@ -222,14 +227,54 @@ def test_placeholder_model_defaults_preserve_explicit_settings(tmp_path, monkeyp
 
     def collect(target, tokens):
         config = global_config.get_global_config_dict()
-        model = config.policy_model.responses_api_models.openai_model
-        assert model.openai_model == "existing"
-        assert model.openai_base_url == settings.get("policy_base_url", "http://oracle.invalid/v1")
-        assert model.openai_api_key == "unused"
+        from nemo_gym.cli import env
+
+        assert "policy_model" not in config
+        for key, value in settings.items():
+            assert config[key] == value
+        monkeypatch.setattr(env, "_probe_endpoint", lambda *args: pytest.fail("Oracle must not probe an unused model"))
+        env.RunHelper().wait_for_model_endpoints(config)
         write_jsonl(Path(config.output_jsonl_fpath), [result()])
 
     monkeypatch.setattr(main_module, "dispatch", collect)
     validation_cli(*flags)
+
+
+@pytest.mark.parametrize("directory", ["custom", "responses_api_models"])
+def test_validate_accepts_custom_model_config_in_any_directory(tmp_path, monkeypatch, validation_cli, directory):
+    from nemo_gym import PARENT_DIR
+
+    write_task(tmp_path / "ds" / "a")
+    model_path = tmp_path / directory / "model.yaml"
+    model_path.parent.mkdir()
+    model_path.write_text((PARENT_DIR / "responses_api_models/vllm_model/configs/vllm_model.yaml").read_text())
+
+    def collect(target, tokens):
+        config = global_config.get_global_config_dict()
+        assert list(config.policy_model.responses_api_models) == ["vllm_model"]
+        assert config.policy_model.responses_api_models.vllm_model.base_url == "http://127.0.0.1:8123/v1"
+        write_jsonl(Path(config.output_jsonl_fpath), [result()])
+
+    monkeypatch.setattr(main_module, "dispatch", collect)
+    validation_cli(
+        "--config",
+        str(model_path),
+        "+policy_base_url=http://127.0.0.1:8123/v1",
+        "+policy_api_key=unused",
+        "+policy_model_name=existing",
+    )
+
+
+def test_validate_reports_missing_sandbox_environment_cleanly(tmp_path, monkeypatch, validation_cli, capsys):
+    write_task(tmp_path / "ds" / "a")
+    monkeypatch.delenv("OPENSANDBOX_API_KEY", raising=False)
+    monkeypatch.setattr(main_module, "dispatch", lambda *args: pytest.fail("invalid config must not dispatch"))
+    with pytest.raises(SystemExit) as exc:
+        validation_cli("--sandbox", "opensandbox")
+    assert exc.value.code == 1
+    output = capsys.readouterr()
+    assert "Error:" in output.out and "OPENSANDBOX_API_KEY" in output.out
+    assert "Traceback" not in output.out + output.err
 
 
 def test_validate_reports_preflight_config_errors_cleanly(tmp_path, monkeypatch, validation_cli, capsys):

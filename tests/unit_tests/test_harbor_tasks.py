@@ -641,8 +641,8 @@ class TestCli:
 
     def test_build_run_leaves_host_side_agent_on_loopback(self, tmp_path):
         agent = AgentSelection(tmp_path / "agent.yaml", "oracle_agent", "oracle_agent")
-        _, tokens = build_run(self._prepared(tmp_path), agent, sandbox="docker", overrides=[])
-        assert not any("use_absolute_ip" in token for token in tokens)
+        path, _ = build_run(self._prepared(tmp_path), agent, sandbox="docker", overrides=[])
+        assert yaml.safe_load(path.read_text()).get("use_absolute_ip", False) is False
 
     @pytest.mark.parametrize("override", ["+use_absolute_ip=false", "++use_absolute_ip=false"])
     def test_build_run_respects_caller_use_absolute_ip(self, tmp_path, override):
@@ -1203,6 +1203,7 @@ def test_generated_agent_can_be_overridden_for_versioned_taskset(tmp_path, monke
     from nemo_gym.global_config import get_global_config_dict
     from nemo_gym.tasks.harbor.materialize import agent_instance
 
+    monkeypatch.setattr(global_config, "gethostbyname", lambda _: "192.0.2.20")
     folder = tmp_path / "ds-2.0"
     write_task(folder / "a")
     prepared = prepare_target(str(folder), output_root=tmp_path / "out")

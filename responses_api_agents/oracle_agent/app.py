@@ -162,6 +162,7 @@ class OracleAgent(SimpleResponsesAPIAgent):
             env=env,
             timeout_s=timeout,
             user=task.user,
+            preserve_background_services=True,
         )
         tail = self.config.output_tail_chars
         output = "\n".join(part for part in ((result.stdout or "")[-tail:], (result.stderr or "")[-tail:]) if part)
