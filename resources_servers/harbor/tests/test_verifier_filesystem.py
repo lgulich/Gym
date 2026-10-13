@@ -5,6 +5,7 @@ import asyncio
 import os
 import shlex
 import shutil
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -230,6 +231,9 @@ def test_artifact_root_redirected_after_startup_cannot_receive_verifier_files(tm
         response = client.post("/verify", json=verify_body())
         assert response.status_code == 200
         assert response.json()["mask_sample"] is True
+        assert response.json()["failure_kind"] == "persistence_failed"
+        assert str(server._artifacts_dir) in response.json()["failure_reason"]
+        assert client.post("/verify", json=verify_body()).json() == response.json()
         assert list(outside.iterdir()) == []
         assert not any("test.sh" in call["command"] for call in sandbox.execs)
 
@@ -247,3 +251,47 @@ def test_reused_protocol_id_does_not_read_old_verifier_output(tmp_path, monkeypa
         assert response["failure_kind"] == "harbor:missing_reward"
         assert Path(response["verifier_logs_dir"]) != stale
         assert (stale / "reward.json").read_text() == '{"reward": 1}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("tar") is None, reason="tar is required")
+@pytest.mark.parametrize("umask", [0o002, 0o077])
+async def test_verifier_logs_preserve_directory_permissions_after_transfers(
+    tmp_path, monkeypatch, verifier_tree, umask
+):
+    root, logs, _ = verifier_tree
+    server, task, _, _ = make_server(tmp_path, monkeypatch)
+    server._artifacts_dir.mkdir()
+    server._artifacts_dir.chmod(0o2775)
+    (task.path / "tests/test.sh").write_text(
+        f"echo 1 > {shlex.quote(str(logs / 'verifier/reward.txt'))}\necho useful-output\n"
+    )
+    previous_umask = os.umask(umask)
+    try:
+        expected = server._artifacts_dir / "ordinary-directory"
+        expected.mkdir()
+        outcome = await server._run_verifier(SimpleNamespace(task=task, sandbox=LocalSandbox(), workdir=str(root)))
+    finally:
+        os.umask(previous_umask)
+        await server.shutdown()
+    assert outcome["reward"] == 1 and not outcome.get("mask_sample", False)
+    artifacts = Path(outcome["verifier_logs_dir"])
+    assert artifacts.parent == server._artifacts_dir
+    assert stat.S_IMODE(artifacts.stat().st_mode) == stat.S_IMODE(expected.stat().st_mode)
+    assert (artifacts / "reward.txt").read_text() == "1\n"
+    assert (artifacts / "test-stdout.txt").read_text() == "useful-output\n"
+
+
+def test_artifact_directory_creation_failure_is_cached_storage_failure(tmp_path, monkeypatch):
+    server, task, sandbox, _ = make_server(tmp_path, monkeypatch)
+    with TestClient(server.setup_webserver()) as client:
+        assert client.post("/seed_session", json=seed_body(task)).status_code == 200
+        server._artifacts_dir.write_text("a file blocks the output directory")
+        first = client.post("/verify", json=verify_body())
+        assert first.status_code == 200
+        assert first.json()["mask_sample"] is True
+        assert first.json()["failure_kind"] == "persistence_failed"
+        assert str(server._artifacts_dir) in first.json()["failure_reason"]
+        assert client.post("/verify", json=verify_body()).json() == first.json()
+        assert server._artifacts_dir.read_text() == "a file blocks the output directory"
+        assert not any("test.sh" in call["command"] for call in sandbox.execs)
