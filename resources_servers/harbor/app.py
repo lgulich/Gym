@@ -60,6 +60,7 @@ from nemo_gym.sandbox.compose_config import adapt_non_root_sidecars, opensandbox
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.server_utils import SESSION_ID_KEY
 from nemo_gym.tasks.harbor import DIGEST_KEY, HarborTask, load_task
+from nemo_gym.tasks.harbor.dataset_config import DATASET_FILE
 from nemo_gym.tasks.harbor.models import HarborArtifact, HarborEnvironment
 from nemo_gym.tasks.harbor.task import HarborTaskError
 from resources_servers.harbor.sandbox_io import (
@@ -362,11 +363,13 @@ class HarborResourcesServer(SimpleResourcesServer):
         try:
             snapshot = snapshot_root / folder.name
             shutil.copytree(folder, snapshot, symlinks=True)
-            # The dataset-level image record lives beside the task folders; a Compose task reads it
-            # from its parent, so the snapshot gets a copy at the same relative place.
-            images = folder.parent / COMPOSE_IMAGES_FILE
-            if images.is_file():
-                shutil.copy2(images, snapshot_root / COMPOSE_IMAGES_FILE)
+            # Dataset-level files live beside the task folders and the loader reads them from the
+            # task's parent, so the snapshot gets copies at the same relative place: the dataset's
+            # own settings (dataset.toml) and the recorded image configurations.
+            for name in (DATASET_FILE, COMPOSE_IMAGES_FILE):
+                sidecar = folder.parent / name
+                if sidecar.is_file():
+                    shutil.copy2(sidecar, snapshot_root / name)
             task = load_task(snapshot)
             if task.digest != expected:
                 raise HTTPException(

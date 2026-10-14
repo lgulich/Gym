@@ -337,7 +337,10 @@ class TestSeedWorkdirAndResources:
         assert commands[0] == "mkdir -p /app"
         logs = next(c for c in sandbox.execs if "/logs/artifacts" in c["command"])
         assert "chmod 777 /logs/agent /logs/verifier /logs/artifacts" in logs["command"] and logs["user"] == "root"
-        spec = server._sandbox_spec(task, "/app")
+        # The server resolves the task from its own snapshot; the dataset's settings must reach that copy.
+        seeded = server._sessions["rs-1"].task
+        assert seeded.path != task.path and seeded.env["CIRCLE_NODE_TOTAL"] == "3" and "X" not in seeded.env
+        spec = server._sandbox_spec(seeded, "/app")
         assert spec.env["CIRCLE_NODE_TOTAL"] == "3" and "X" not in spec.env
 
     def test_image_workdir_used_when_task_sets_none(self, tmp_path, monkeypatch):
