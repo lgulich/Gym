@@ -1699,6 +1699,7 @@ def test_existing_unpinned_task_is_never_relabeled(tmp_path, registry_repo):
     assert not (existing.parent / "manifest.toml").exists()
 
 
+@pytest.mark.usefixtures("fake_registry")  # prepare records base images; never reach Docker Hub
 def test_registry_versions_keep_distinct_rows_routes_and_outputs(tmp_path, monkeypatch):
     import nemo_gym.tasks.harbor.cli as harbor_cli
 
@@ -1719,6 +1720,7 @@ def test_registry_versions_keep_distinct_rows_routes_and_outputs(tmp_path, monke
         assert yaml.safe_load(path.read_text())["output_jsonl_fpath"] == str(prepared.output_dir / "rollouts.jsonl")
 
 
+@pytest.mark.usefixtures("fake_registry")  # prepare records base images; never reach Docker Hub
 def test_config_overlays_win_after_real_loading_and_inheritance(tmp_path):
     from hydra.core.override_parser.overrides_parser import OverridesParser
     from omegaconf import OmegaConf
@@ -2062,6 +2064,7 @@ def test_interrupted_cache_repair_preserves_pending_pins(tmp_path, registry_repo
     assert (folder / "c" / "instruction.md").read_text().startswith("Create a file")
 
 
+@pytest.mark.usefixtures("fake_registry")  # prepare records base images; never reach Docker Hub
 @pytest.mark.parametrize("external", [False, True])
 def test_symlinked_child_tasks_are_reported_without_duplicate_rows(tmp_path, external):
     folder = tmp_path / "ds"
@@ -2111,6 +2114,7 @@ def test_generated_instance_names_are_override_safe_and_collision_free():
             assert override.key_or_group == f"{name}.setting"
 
 
+@pytest.mark.usefixtures("fake_registry")  # prepare records base images; never reach Docker Hub
 def test_generated_agent_can_be_overridden_for_versioned_taskset(tmp_path, monkeypatch):
     import sys
 
