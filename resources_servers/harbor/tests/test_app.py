@@ -502,6 +502,25 @@ class TestSeedWorkdirAndResources:
         spec = server._sandbox_spec(seeded, "/app")
         assert spec.env["CIRCLE_NODE_TOTAL"] == "3" and "X" not in spec.env
 
+    def test_build_mode_task_seeds_from_its_recorded_image(self, tmp_path, monkeypatch):
+        from nemo_gym.tasks.harbor.digest import context_digest
+        from nemo_gym.tasks.harbor.task import BUILT_IMAGES_FILE
+
+        server, task, _, _ = make_server(tmp_path, monkeypatch)
+        # A Dockerfile that needs a build resolves to the image prepare recorded beside the task folders.
+        (task.path / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\nCOPY . /app\n")
+        built = {context_digest(task.path / "environment"): {"image": "registry.example/ds-hello:abc"}}
+        (task.path.parent / BUILT_IMAGES_FILE).write_text(json.dumps(built))
+        task = load_task(task.path)
+        assert task.image == "registry.example/ds-hello:abc"
+        server.config.tasksets["ds"].tasks["hello"] = task.digest
+
+        response = TestClient(server.setup_webserver()).post("/seed_session", json=seed_body(task))
+
+        # The server loads the task from its own snapshot, which must see the same record.
+        assert response.status_code == 200, response.text
+        assert server._sessions["rs-1"].task.image == task.image
+
     def test_image_workdir_used_when_task_sets_none(self, tmp_path, monkeypatch):
         server, task, sandbox, created = make_server(tmp_path, monkeypatch)
         # A task with a real Dockerfile and a prebuilt image declares no workdir; the image's WORKDIR is used.

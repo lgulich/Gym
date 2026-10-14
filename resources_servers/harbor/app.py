@@ -67,7 +67,7 @@ from nemo_gym.tasks.harbor.dataset_config import DATASET_FILE
 from nemo_gym.tasks.harbor.dockerfile import OverlayRun
 from nemo_gym.tasks.harbor.image_configs import load_compose_document
 from nemo_gym.tasks.harbor.models import HarborArtifact, HarborEnvironment
-from nemo_gym.tasks.harbor.task import HarborTaskError
+from nemo_gym.tasks.harbor.task import BUILT_IMAGES_FILE, HarborTaskError
 from resources_servers.harbor.sandbox_io import (
     _exec_as_root,
     download_dir,
@@ -460,8 +460,8 @@ class HarborResourcesServer(SimpleResourcesServer):
             shutil.copytree(folder, snapshot, symlinks=True)
             # Dataset-level files live beside the task folders and the loader reads them from the
             # task's parent, so the snapshot gets copies at the same relative place: the dataset's
-            # own settings (dataset.toml) and the recorded image configurations.
-            for name in (DATASET_FILE, COMPOSE_IMAGES_FILE):
+            # own settings (dataset.toml), the recorded image configurations and the built images.
+            for name in (DATASET_FILE, COMPOSE_IMAGES_FILE, BUILT_IMAGES_FILE):
                 sidecar = folder.parent / name
                 if sidecar.is_file():
                     shutil.copy2(sidecar, snapshot_root / name)
