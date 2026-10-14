@@ -96,7 +96,8 @@ def test_unsupported_semantics_fail_before_provisioning(tmp_path, monkeypatch, v
     assert created == []
 
 
-@pytest.mark.parametrize("build_file", [None, "Dockerfile", "docker-compose.yaml", "docker-compose.yml"])
+# A Compose file makes the task a Compose group (M13), covered by TestComposeAndRouting.
+@pytest.mark.parametrize("build_file", [None, "Dockerfile"])
 def test_prebuilt_environment_files_only_uploaded_without_build_definition(tmp_path, monkeypatch, build_file):
     toml = TASK_TOML.replace("[environment]", '[environment]\ndocker_image = "ubuntu:24.04"')
     server, task, sandbox, _ = make_server(tmp_path, monkeypatch, toml=toml)
