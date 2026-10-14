@@ -326,7 +326,7 @@ def dockerfile_base_images(folder: Path, *, select: Callable[[str], bool] | None
     to report.
     """
     # Resolved like load_task does: overrides are keyed by the task folder's name and dataset.toml
-    # sits beside the task folders.
+    # sits beside the task folders, or one level up for datasets/<name>/tasks/.
     folder = Path(folder).resolve()
     single = is_task_folder(folder)
     children = [folder] if single else sorted(child for child in folder.iterdir() if child.is_dir())

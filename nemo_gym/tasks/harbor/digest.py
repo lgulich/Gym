@@ -45,3 +45,34 @@ def content_hash(path: Path) -> str:
             file_hash = hashlib.file_digest(stream, "sha256").hexdigest()
         digest.update(f"{relative}\0{file_hash}\n".encode())
     return digest.hexdigest()
+
+
+def context_digest(path: Path) -> str:
+    """Digest a Dockerfile build context (a task's ``environment/`` folder).
+
+    SHA256 over sorted ``relative_path NUL file_sha256 NUL mode LF`` records of every regular file
+    under ``path``, where ``mode`` is ``x`` for an executable file, ``-`` otherwise and ``l`` for a
+    symbolic link, which contributes the text of its target instead of the file it points at. Two contexts with the same files build the same image, so the digest keys the build
+    record (see ``nemo_gym.tasks.harbor.image_build``).
+    """
+    path = Path(path)
+    if not path.is_dir():
+        raise ValueError(f"Not a build context folder: {path}")
+    digest = hashlib.sha256()
+    files = sorted(
+        (p for p in path.rglob("*") if p.is_file() or p.is_symlink()), key=lambda p: p.relative_to(path).as_posix()
+    )
+    for file in files:
+        relative = file.relative_to(path).as_posix()
+        if _ignored(relative):
+            continue
+        if file.is_symlink():
+            file_hash = hashlib.sha256(str(file.readlink()).encode()).hexdigest()
+            mode = "l"
+        else:
+            with file.open("rb") as stream:
+                file_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+            # COPY carries the executable bit into the image, so it is part of the context.
+            mode = "x" if file.stat().st_mode & 0o111 else "-"
+        digest.update(f"{relative}\0{file_hash}\0{mode}\n".encode())
+    return digest.hexdigest()

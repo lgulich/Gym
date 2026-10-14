@@ -713,6 +713,52 @@ ONLY_TASKS = Flag(
     ),
 )
 
+# Dockerfile builds for a task TARGET (image mode three; pull and overlay need no build). Register-only:
+# consumed by the Harbor prepare step.
+BUILD_TOOL = Flag(
+    register=lambda p: p.add_argument(
+        "--build-tool",
+        choices=("buildah", "podman", "docker"),
+        metavar="TOOL",
+        help="Tool that builds Dockerfiles outside pull and overlay mode: buildah, podman or docker "
+        "(default: the first one on PATH).",
+    ),
+)
+
+BUILD_REPOSITORY = Flag(
+    register=lambda p: p.add_argument(
+        "--build-repository",
+        metavar="REGISTRY/PATH",
+        help="Push built images to this repository, tagged by build-context digest (default: the "
+        "NEMO_GYM_BUILD_REPOSITORY environment variable; unset keeps images local under "
+        "localhost/nemo-gym-harbor/<taskset>).",
+    ),
+)
+
+BUILD_PLATFORM = Flag(
+    register=lambda p: p.add_argument(
+        "--build-platform",
+        metavar="OS/ARCH",
+        help="Platform passed to the build tool (e.g. linux/amd64) when the builder can emulate it.",
+    ),
+)
+
+NO_BUILD = Flag(
+    register=lambda p: p.add_argument(
+        "--no-build",
+        action="store_true",
+        help="Never build a Dockerfile; tasks that need a build are skipped with a message.",
+    ),
+)
+
+REBUILD = Flag(
+    register=lambda p: p.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Drop the recorded builds of the selected tasks' Dockerfiles and build them again.",
+    ),
+)
+
 
 def _eval_health_check(args: argparse.Namespace, overrides: list[str]) -> None:
     expected_overrides = ["+verbose=true"] if args.verbose else []
@@ -999,6 +1045,11 @@ COMMANDS = {
             _value_flag("limit", "limit", "Maximum number of tasks to validate."),
             EXCLUDE_TASKS,
             ONLY_TASKS,
+            BUILD_TOOL,
+            BUILD_REPOSITORY,
+            BUILD_PLATFORM,
+            NO_BUILD,
+            REBUILD,
             _value_flag("output", "output_jsonl_fpath", "Output rollouts JSONL file.", aliases=("-o",)),
         ),
     ),
@@ -1192,6 +1243,11 @@ COMMANDS = {
             _value_flag("agent", "agent_name", "Agent to collect rollouts with.", aliases=("-a",)),
             EXCLUDE_TASKS,
             ONLY_TASKS,
+            BUILD_TOOL,
+            BUILD_REPOSITORY,
+            BUILD_PLATFORM,
+            NO_BUILD,
+            REBUILD,
             _value_flag("input", "input_jsonl_fpath", "Input tasks JSONL file.", aliases=("-i",)),
             _value_flag("output", "output_jsonl_fpath", "Output rollouts JSONL file.", aliases=("-o",)),
             _value_flag("limit", "limit", "Maximum number of tasks to run."),

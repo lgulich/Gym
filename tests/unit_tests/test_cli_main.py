@@ -293,6 +293,53 @@ class TestHarborTargetFlags:
         args, _ = self._args_for(monkeypatch, "run_target", ["eval", "run", "harbor:o/ds@4.0.0", "--agent", "a"])
         assert args.force is False
 
+    def test_eval_run_build_flags(self, monkeypatch: MonkeyPatch) -> None:
+        args, overrides = self._args_for(
+            monkeypatch,
+            "run_target",
+            [
+                "eval",
+                "run",
+                "environments/x",
+                "--agent",
+                "a",
+                "--build-tool",
+                "buildah",
+                "--build-repository",
+                "reg.example/team/harbor",
+                "--build-platform",
+                "linux/amd64",
+                "--no-build",
+                "--rebuild",
+            ],
+        )
+        assert (args.build_tool, args.build_repository, args.build_platform, args.no_build, args.rebuild) == (
+            "buildah",
+            "reg.example/team/harbor",
+            "linux/amd64",
+            True,
+            True,
+        )
+        assert not any("build" in o for o in overrides)
+
+    def test_eval_run_build_flags_default_off(self, monkeypatch: MonkeyPatch) -> None:
+        args, _ = self._args_for(monkeypatch, "run_target", ["eval", "run", "environments/x", "--agent", "a"])
+        assert (args.build_tool, args.build_repository, args.build_platform, args.no_build, args.rebuild) == (
+            None,
+            None,
+            None,
+            False,
+            False,
+        )
+
+    def test_dataset_validate_build_flags(self, monkeypatch: MonkeyPatch) -> None:
+        args, _ = self._args_for(
+            monkeypatch,
+            "validate_target",
+            ["dataset", "validate", "environments/x", "--no-build", "--build-tool", "docker"],
+        )
+        assert args.no_build is True and args.build_tool == "docker"
+
     def test_dataset_validate_force(self, monkeypatch: MonkeyPatch) -> None:
         args, overrides = self._args_for(
             monkeypatch, "validate_target", ["dataset", "validate", "harbor:o/ds", "--force"]

@@ -18,6 +18,7 @@ import fnmatch
 import json
 import logging
 import math
+import os
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -31,14 +32,22 @@ from nemo_gym.config_types import ConfigError
 from nemo_gym.path_utils import failures_path_for
 from nemo_gym.tasks.harbor.digest import DIGEST_KEY
 from nemo_gym.tasks.harbor.hub import HubError, datasets_dir, fetch_ref, is_hub_ref
+from nemo_gym.tasks.harbor.image_build import REPOSITORY_ENV, BuildError, ImageBuilder, build_images, plan_builds
 from nemo_gym.tasks.harbor.image_configs import record_base_images, record_compose_images
 from nemo_gym.tasks.harbor.materialize import run_config, write_rows
-from nemo_gym.tasks.harbor.task import HarborTask, HarborTaskError, discover_tasks, is_task_folder
+from nemo_gym.tasks.harbor.task import (
+    HarborTask,
+    HarborTaskError,
+    discover_tasks,
+    is_task_folder,
+    read_built_images,
+)
 
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_ROOT = Path("results/harbor")
+IMAGES_FILE = "images.json"
 ENVIRONMENT_SERVER_CONFIG = "environment_servers/single_agent_turn/configs/single_agent_turn.yaml"
 RESOURCES_SERVER_CONFIG = "resources_servers/harbor/configs/harbor.yaml"
 ORACLE_AGENT = "oracle_agent"
@@ -75,6 +84,27 @@ AGENT_OVERRIDES: dict[str, dict[str, Any]] = {
 
 
 @dataclass(frozen=True)
+class BuildOptions:
+    """How prepare treats Dockerfiles outside pull and overlay mode (see ``--build-*`` and ``--no-build``)."""
+
+    enabled: bool = True
+    tool: str | None = None
+    repository: str | None = None
+    platform: str | None = None
+    rebuild: bool = False
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "BuildOptions":
+        return cls(
+            enabled=not getattr(args, "no_build", False),
+            tool=getattr(args, "build_tool", None) or None,
+            repository=getattr(args, "build_repository", None) or os.environ.get(REPOSITORY_ENV) or None,
+            platform=getattr(args, "build_platform", None) or None,
+            rebuild=bool(getattr(args, "rebuild", False)),
+        )
+
+
+@dataclass(frozen=True)
 class PreparedTaskset:
     taskset: str
     folder: Path
@@ -82,6 +112,8 @@ class PreparedTaskset:
     rows_path: Path
     output_dir: Path
     skipped: dict[str, str] = field(default_factory=dict)
+    # Every distinct image the prepared tasks start from, for pre-pulling.
+    images: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -107,17 +139,20 @@ def prepare_target(
     force: bool = False,
     exclude: list[str] | None = None,
     only: list[str] | None = None,
+    build: BuildOptions | None = None,
 ) -> PreparedTaskset:
     """Fetch (for hub references) and load the tasks, then write the rows file.
 
     A task folder that does not load is skipped with a warning (and listed in
     ``PreparedTaskset.skipped``) so the rest of the dataset still prepares. ``force``
     lets a fetch replace task folders whose content differs from the Harbor store.
-    ``PreparedTaskset.skipped``) so the rest of the dataset still prepares.
 
     Tasks matching an ``exclude`` glob, or not matching an ``only`` glob, are left out of the
-    rows and listed on stdout.
+    rows and listed on stdout. Dockerfiles outside pull and overlay mode are built once and
+    recorded before the tasks load, as ``build`` says (the default builds locally with the first
+    of buildah, podman and docker on PATH, and pushes when a repository is named).
     """
+    build = build or BuildOptions()
     if is_hub_ref(target):
         folder = fetch_ref(target, refresh_registry=refresh_registry, force=force)
         print(f"Fetched {target} into {folder}")
@@ -139,6 +174,8 @@ def prepare_target(
     )
     if images is not None:
         print(f"Base image configurations recorded in {images}")
+    if folder.is_dir():
+        _build_dockerfiles(folder, taskset, build, select=None if is_task_folder(folder) else selected)
     output_dir = Path(output_root) / taskset
     output_dir.mkdir(parents=True, exist_ok=True)
     errors: dict[str, HarborTaskError] = {}
@@ -166,6 +203,13 @@ def prepare_target(
     write_rows(tasks, taskset, rows_path)
     skipped_note = f", skipped {len(errors)}" if errors else ""
     print(f"Materialized {len(tasks)} task(s) from {folder} into {rows_path}{skipped_note}")
+    distinct = tuple(sorted({task.image for task in tasks if task.image}))
+    # Every distinct image, for pre-pulling onto the sandbox hosts before a run.
+    (output_dir / IMAGES_FILE).write_text(json.dumps(list(distinct), indent=2) + "\n")
+    if distinct:
+        print(f"Images: {len(distinct)} distinct, listed in {output_dir / IMAGES_FILE}")
+        for image in distinct:
+            print(f"  {image}")
     return PreparedTaskset(
         taskset=taskset,
         folder=folder,
@@ -173,6 +217,37 @@ def prepare_target(
         rows_path=rows_path,
         output_dir=output_dir,
         skipped={task_id: str(error) for task_id, error in errors.items()},
+        images=distinct,
+    )
+
+
+def _build_dockerfiles(folder: Path, taskset: str, build: BuildOptions, *, select) -> None:
+    """Build and record the images of the selected tasks whose Dockerfile needs a build.
+
+    With builds disabled, the tasks that need one are left for the loader to skip with its
+    message. A missing builder or a failed build stops the preparation, naming the tasks.
+    """
+    plan = plan_builds(folder, select=select)
+    if not plan:
+        return
+    names = ", ".join(task for entry in plan for task in entry.tasks[:3])
+    if not build.enabled:
+        parent = folder.parent if is_task_folder(folder) else folder
+        recorded = read_built_images(parent)
+        unbuilt = [task for entry in plan if entry.digest not in recorded for task in entry.tasks[:3]]
+        if unbuilt:
+            print(f"Skipping Dockerfile builds (--no-build); tasks that need one are left out: {', '.join(unbuilt)}")
+        return
+    try:
+        builder = ImageBuilder(tool=build.tool, repository=build.repository, platform=build.platform, taskset=taskset)
+        results = build_images(folder, builder=builder, select=select, rebuild=build.rebuild)
+    except BuildError as exc:
+        raise ValueError(f"Could not build the Dockerfile image(s) for task(s) {names}: {exc}") from exc
+    if not results:
+        return
+    pushed = sum(1 for result in results if result.pushed)
+    print(
+        f"Built {len(results)} image(s) with {results[0].tool}" + (f", pushed {pushed}" if pushed else ", kept local")
     )
 
 
@@ -344,8 +419,9 @@ def run_target(args: argparse.Namespace, overrides: list[str]) -> None:
             exclude=_patterns(args, "exclude_tasks"),
             only=_patterns(args, "only_tasks"),
             force=getattr(args, "force", False),
+            build=BuildOptions.from_args(args),
         )
-    except (HarborTaskError, HubError, ValueError, OSError) as exc:
+    except (HarborTaskError, HubError, BuildError, ValueError, OSError) as exc:
         args._parser.error(str(exc))
     if prepared.skipped and not getattr(args, "skip_unloadable", False):
         args._parser.error(
@@ -382,8 +458,9 @@ def validate_target(args: argparse.Namespace, overrides: list[str]) -> None:
             exclude=_patterns(args, "exclude_tasks"),
             only=_patterns(args, "only_tasks"),
             force=getattr(args, "force", False),
+            build=BuildOptions.from_args(args),
         )
-    except (HarborTaskError, HubError, ValueError, OSError, yaml.YAMLError) as exc:
+    except (HarborTaskError, HubError, BuildError, ValueError, OSError, yaml.YAMLError) as exc:
         args._parser.error(str(exc))
     unvalidated = [task.task_id for task in prepared.tasks if not task.has_solution]
     prepared = replace(prepared, tasks=[task for task in prepared.tasks if task.has_solution])

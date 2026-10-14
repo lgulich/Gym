@@ -126,6 +126,11 @@ class FakeSandbox:
     dirs: dict[str, str] = field(default_factory=lambda: {"/": "root", "/tmp": "root", "/home": "root"})
     passwd: dict[str, str] = field(default_factory=lambda: {"0": "root", "1000": "agent"})
 
+    default_user: str | None = None
+
+    def set_default_user(self, user):
+        self.default_user = user
+
     def run(self, fragment: str) -> dict:
         """The record of the one exec whose command, prefix aside, holds ``fragment``."""
         (record,) = [c for c in self.execs if c.get("seen") and fragment in c["seen"]["command"]]
@@ -423,6 +428,56 @@ class TestSeed:
         assert (spec.resources.cpu, spec.resources.memory_mib, spec.resources.disk_gib) == (1.0, 2048, 10)
         assert spec.metadata["sandbox-api"] == "osb"
         assert spec.metadata["harbor_task"] == "hello"
+        assert spec.user is None  # no USER in the Dockerfile and no [agent].user: the image's own default
+
+    def test_sandbox_spec_user_is_the_dockerfile_user_for_the_task_image_only(self, tmp_path, monkeypatch):
+        server, task, _, _ = make_server(tmp_path, monkeypatch, dockerfile="FROM ubuntu:24.04\nUSER agent\n")
+        monkeypatch.setattr(
+            "resources_servers.harbor.app.get_global_config_dict", lambda: {"sandbox": {"opensandbox": {}}}
+        )
+        assert task.user == "agent"
+        assert server._sandbox_spec(task, "/app").user == "agent"
+        # A root-overlay step still asks for root explicitly when the sandbox default is agent.
+        assert server._sandbox_spec(task, "/app", image=task.image).user == "agent"
+        # A separate verifier in a different image keeps that image's own default user.
+        assert server._sandbox_spec(task, None, image="org/verifier:1", role="verifier").user is None
+
+
+class TestDefaultUser:
+    def test_numeric_agent_user_without_an_overlay_is_resolved_by_name(self, tmp_path, monkeypatch, caplog):
+        toml = TASK_TOML.replace("[agent]\ntimeout_sec = 300.0", '[agent]\ntimeout_sec = 300.0\nuser = "1000"')
+        server, task, sandbox, _ = make_server(tmp_path, monkeypatch)
+        (task.path / "task.toml").write_text(toml)
+        task = load_task(task.path)
+        assert task.user == "1000" and not task.overlay
+        server.config.tasksets["ds"].tasks["hello"] = task.digest
+        monkeypatch.setattr(
+            "resources_servers.harbor.app.get_global_config_dict", lambda: {"sandbox": {"opensandbox": {}}}
+        )
+        # No overlay: the spec carries the uid as written, and the seed resolves it to a name once.
+        assert server._sandbox_spec(task, "/app").user == "1000"
+        assert TestClient(server.setup_webserver()).post("/seed_session", json=seed_body(task)).status_code == 200
+        assert [c["command"] for c in sandbox.execs if "getent" in c["command"]] == [
+            "getent passwd 1000 | cut -d: -f1"
+        ]
+        assert sandbox.default_user == "agent"
+
+        # A uid that names no user stays numeric, with a warning (a fresh session: a repeated seed is a replay).
+        sandbox.passwd.pop("1000")
+        sandbox.default_user = None
+        body = seed_body(task, session="rs-2") | {"episode_id": {"rollout_id": "r2", "attempt": 0}}
+        with caplog.at_level("WARNING"):
+            assert TestClient(server.setup_webserver()).post("/seed_session", json=body).status_code == 200
+        assert sandbox.default_user == "1000" and "USER 1000 names no user" in caplog.text
+
+    def test_named_user_is_set_as_the_default_after_seed(self, tmp_path, monkeypatch):
+        server, task, sandbox, _ = make_server(tmp_path, monkeypatch, dockerfile="FROM ubuntu:24.04\nUSER agent\n")
+        monkeypatch.setattr(
+            "resources_servers.harbor.app.get_global_config_dict", lambda: {"sandbox": {"opensandbox": {}}}
+        )
+        assert TestClient(server.setup_webserver()).post("/seed_session", json=seed_body(task)).status_code == 200
+        assert sandbox.default_user == "agent"
+        assert not any("getent" in c["command"] for c in sandbox.execs)
 
 
 class TestSeedWorkdirAndResources:
@@ -629,16 +684,16 @@ class TestOverlay:
             "user": "agent",
             "cwd": "/app",
         }
-        # Lines before `USER agent` run as root, which is the image's own default user, so without an override
-        # (every provider supports the plain exec path); after it, as agent.
-        assert task.sandbox_user is None
-        assert [c["user"] for c in (first, second, third)] == [None, None, "agent"]
+        # Lines before `USER agent` run as root. The image's own default user is root, but the sandbox was
+        # created with the Dockerfile's final USER (agent) as its exec default, so root is asked for explicitly.
+        assert task.sandbox_user is None and task.user == "agent"
+        assert [c["user"] for c in (first, second, third)] == ["root", "root", "agent"]
         assert all(c["cwd"] == "/" and c["env"] is None for c in (first, second, third))
         commands = [c["command"] for c in sandbox.execs]
         # /app is made as root when the first RUN after `WORKDIR /app` comes up, once, then only entered.
         assert commands[:4] == [first["command"], "mkdir -p /app", second["command"], third["command"]]
         assert first["command"] == f"unset MSG; export PATH={IMAGE_PATH}; cd / || exit 1; {first['seen']['command']}"
-        assert sandbox.execs[1]["user"] is None and commands.count("mkdir -p /app") == 1
+        assert sandbox.execs[1]["user"] == "root" and commands.count("mkdir -p /app") == 1
         # The overlay shares the task's build budget: the first line sees all of it, later ones what is left.
         assert first["timeout_s"] == pytest.approx(task.config.environment.build_timeout_sec, abs=1)
         assert second["timeout_s"] <= first["timeout_s"] and third["timeout_s"] <= second["timeout_s"]
@@ -677,7 +732,7 @@ class TestOverlay:
         assert prepare["command"] == (
             "test -d /home/agent/work || (mkdir -p /home/agent/work && chown agent /home/agent/work)"
         )
-        assert prepare["user"] is None  # the image's default user is root already
+        assert prepare["user"] == "root"  # the sandbox's exec default is the Dockerfile's final USER (agent)
         assert sandbox.dirs["/home/agent/work"] == "agent" and sandbox.dirs["/home/agent"] == "root"
         assert run["seen"] == {
             "command": "touch made",
@@ -696,11 +751,13 @@ class TestOverlay:
 
         assert response.status_code == 200, response.text
         lookup, prepare, first, second = sandbox.execs[:4]
-        assert lookup["command"] == "getent passwd 1000 | cut -d: -f1" and lookup["user"] is None
+        assert lookup["command"] == "getent passwd 1000 | cut -d: -f1" and lookup["user"] == "root"
         # The name serves the directory's owner and both lines; the lookup happens once.
-        assert prepare["command"].endswith("chown agent /home/agent/work)") and prepare["user"] is None
+        assert prepare["command"].endswith("chown agent /home/agent/work)") and prepare["user"] == "root"
         assert [c["seen"]["user"] for c in (first, second)] == ["agent", "agent"]
         assert sum("getent" in c["command"] for c in sandbox.execs) == 1
+        # The resolved name, not the uid, becomes the sandbox's default user after the overlay.
+        assert sandbox.default_user == "agent"
 
     def test_root_steps_on_a_non_root_image_override_the_image_user(self, tmp_path, monkeypatch):
         # jupyter/base-notebook style: the image runs as jovyan, the Dockerfile switches to root and stays there.
@@ -1495,9 +1552,117 @@ class TestComposeAndRouting:
         assert response.status_code == 200, response.text
         services = documents[0]["services"]
         assert services["main"]["image"] == IMAGE_CONFIGS["org/agent:1"]["image"]
-        assert services["main"]["volumes"] == [f"{task.path / 'environment'}/seed.json:/app/seed.json:ro"]
+        # CONTEXT_DIR is the environment folder of the task the server seeded: its private snapshot.
+        context = server._sessions["rs-1"].task.path / "environment"
+        assert context != task.path / "environment"
+        assert services["main"]["volumes"] == [f"{context}/seed.json:/app/seed.json:ro"]
         assert services["api"]["environment"] == {"API_MODE": "replay"} and "env_file" not in services["api"]
         assert services["kafka"]["environment"] == {"KAFKA_TOPIC": "events"}
+
+    def test_overlay_compose_task_starts_without_the_task_user_and_switches_after_the_overlay(
+        self, tmp_path, monkeypatch
+    ):
+        """The compose adapter's bootstrap execs run through the facade default before any overlay RUN line has
+        created the task's user, so an overlay task starts with no default user and gets it afterwards."""
+        import resources_servers.harbor.app as app_module
+        from nemo_gym.sandbox.providers.base import SandboxHandle
+
+        class DockerLikeProvider:
+            """exec behaves like `docker exec --user <name>`: it fails until the user exists in the container."""
+
+            name = "fake"
+
+            def __init__(self):
+                self.created, self.execs, self.users = [], [], {"root"}
+
+            def __contains__(self, key):  # `_compose_document` asks `"opensandbox" in provider`
+                return False
+
+            async def create(self, spec):
+                self.created.append(spec)
+                return SandboxHandle(str(len(self.created)), self.name, None)
+
+            async def exec(self, handle, command, *, cwd=None, env=None, timeout_s=None, user=None):
+                self.execs.append({"user": user, "command": command})
+                if user not in (None, "root", 0) and str(user) not in self.users:
+                    return SandboxExecResult("", f"unable to find user {user}", 126, error_type="sandbox")
+                if "useradd" in command:
+                    self.users.add("agent")
+                return SandboxExecResult("", "", 0)
+
+            async def upload_file(self, handle, source_path, target_path):
+                pass
+
+            def validate_networking(self):
+                pass
+
+            async def network_address(self, handle):
+                return "192.0.2.1"
+
+            async def set_hosts(self, handle, hosts):
+                pass
+
+            async def close(self, handle):
+                pass
+
+            async def aclose(self):
+                pass
+
+        server, task, _, _ = make_server(
+            tmp_path, monkeypatch, dockerfile="FROM ubuntu:24.04\nRUN useradd -m agent\nUSER agent\n"
+        )
+        (task.path / "task.toml").write_text(TASK_TOML)
+        (task.path / "environment" / "docker-compose.yaml").write_text(
+            "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n    command: ['sleep', 'infinity']\n"
+        )
+        task = load_task(task.path)
+        assert task.user == "agent" and task.overlay and task.needs_compose
+        server.config.tasksets["ds"].tasks["hello"] = task.digest
+        provider = DockerLikeProvider()
+        monkeypatch.setattr(app_module, "get_global_config_dict", lambda: {"sandbox": {"docker": {}}})
+        monkeypatch.setattr(app_module, "resolve_provider_config", lambda ref, cfg: provider)
+
+        async def run():
+            compose = await server._create_compose(task, "rs-1")
+            main = compose.services["main"]
+            bootstrap_users = {e["user"] for e in provider.execs}
+            assert provider.created[0].user is None and main.default_user is None
+            assert "agent" not in bootstrap_users, provider.execs
+            names = await server._apply_overlay(main, task)
+            await server._set_default_user(main, task, names)
+            assert any("useradd" in e["command"] for e in provider.execs)
+            assert main.default_user == "agent"
+            # From here every exec that names no user runs as the task's user.
+            await main.exec("id")
+            assert provider.execs[-1]["user"] == "agent"
+
+        asyncio.run(run())
+
+    def test_sidecar_specs_do_not_inherit_the_task_user(self, tmp_path, monkeypatch):
+        server, task, _, _ = make_server(tmp_path, monkeypatch, dockerfile="FROM ubuntu:24.04\nUSER agent\n")
+        (task.path / "task.toml").write_text(COMPOSE_TOML)
+        (task.path / "environment" / "docker-compose.yaml").write_text(COMPOSE_YAML)
+        (task.path.parent / "compose-images.json").write_text(json.dumps(IMAGE_CONFIGS))
+        task = load_task(task.path)
+        assert task.user == "agent"
+        monkeypatch.setattr(
+            "resources_servers.harbor.app.get_global_config_dict", lambda: {"sandbox": {"opensandbox": {}}}
+        )
+        captured = {}
+
+        class FakeComposeGroup:
+            def __init__(self, provider_config, path, *, service_specs, timeout_s):
+                captured["specs"] = service_specs
+
+            async def start(self):
+                return None
+
+        monkeypatch.setattr("resources_servers.harbor.app.AsyncSandboxCompose", FakeComposeGroup)
+        server.config.artifacts_dir = tmp_path / "artifacts"
+        asyncio.run(server._create_compose(task, "rs-1"))
+        specs = captured["specs"]
+        assert specs["main"].user == "agent"
+        assert {name: spec.user for name, spec in specs.items() if name != "main"} == {"api": None, "kafka": None}
 
     def test_compose_task_seeds_a_group_and_leaves_task_context(self, tmp_path, monkeypatch):
         server, task, compose, documents = self.compose_server(tmp_path, monkeypatch)
