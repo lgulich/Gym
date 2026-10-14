@@ -592,12 +592,13 @@ class HarborResourcesServer(SimpleResourcesServer):
             "skills_dir": environment.skills_dir,
         }
         payload = shlex.quote(json.dumps(context))
-        result = await sandbox.exec(
-            f"mkdir -p {TASK_CONTEXT_DIR} && chmod 755 {TASK_CONTEXT_DIR} && printf %s {payload} > {TASK_CONTEXT_FILE} "
-            f"&& chmod 644 {TASK_CONTEXT_FILE}",
-            cwd="/",
+        # Root first, falling back to the default user on sandboxes that cannot switch identities; /tmp
+        # is writable either way, and the modes only need the agent's own user to read the file.
+        result = await _exec_as_root(
+            sandbox,
+            f"mkdir -p {TASK_CONTEXT_DIR} && printf %s {payload} > {TASK_CONTEXT_FILE} "
+            f"&& (chmod 755 {TASK_CONTEXT_DIR} && chmod 644 {TASK_CONTEXT_FILE} || true)",
             timeout_s=60,
-            user="root",
         )
         if result.return_code:
             raise RuntimeError(f"Could not write {TASK_CONTEXT_FILE}: {result.stderr or result.stdout}")
