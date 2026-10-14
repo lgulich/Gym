@@ -418,7 +418,8 @@ class HarborResourcesServer(SimpleResourcesServer):
 
     async def _run_setup_commands(self, sandbox: AsyncSandbox, task: HarborTask) -> None:
         for command in self.config.sandbox_setup_commands:
-            result = await sandbox.exec(command, cwd="/", timeout_s=self.config.sandbox_setup_timeout_s, user="root")
+            # Root first, like every other setup step; sandboxes that cannot switch users fall back.
+            result = await _exec_as_root(sandbox, command, timeout_s=self.config.sandbox_setup_timeout_s)
             if result.return_code != 0:
                 raise RuntimeError(
                     f"Sandbox setup command failed for {task.task_id!r} (exit {result.return_code}): "
