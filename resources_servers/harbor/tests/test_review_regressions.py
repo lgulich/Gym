@@ -81,18 +81,15 @@ def test_templates_resolve_at_use_without_changing_materialized_task(tmp_path, m
     assert "verifier-secret" not in (server._sessions["rs-1"].task.path / "task.toml").read_text()
 
 
-@pytest.mark.parametrize("variant", ["agent_user", "dockerfile_user", "separate", "verifier_environment"])
+@pytest.mark.parametrize("variant", ["agent_user", "dockerfile_user"])
 def test_unsupported_semantics_fail_before_provisioning(tmp_path, monkeypatch, variant):
+    # Separate verification is supported since M10; agent user overrides arrive with overlay images.
     toml = TASK_TOML
     dockerfile = "FROM ubuntu:24.04\nWORKDIR /app"
     if variant == "agent_user":
         toml = toml.replace("[agent]", '[agent]\nuser = "nobody"')
-    elif variant == "dockerfile_user":
-        dockerfile += "\nUSER nobody"
-    elif variant == "separate":
-        toml = toml.replace("[verifier]", '[verifier]\nenvironment_mode = "separate"')
     else:
-        toml += '\n[verifier.environment]\ndocker_image = "ubuntu:24.04"\n'
+        dockerfile += "\nUSER nobody"
     server, task, _, created = make_server(tmp_path, monkeypatch, toml=toml, dockerfile=dockerfile)
     response = TestClient(server.setup_webserver()).post("/seed_session", json=seed_body(task))
     assert response.status_code == 422 and "not supported" in response.text
