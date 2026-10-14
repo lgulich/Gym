@@ -30,6 +30,8 @@ class FakeCoordination:
         self.retire_failures = 0
         # Forget calls refused before one succeeds, as a server refuses while it still holds a session of the rollout.
         self.forget_failures = 0
+        # Release calls that fail before one succeeds.
+        self.release_failures = 0
         # Capture keys a participant reports it cannot capture.
         self.restarts: list[str] = []
         self.prepare_started = asyncio.Event()
@@ -87,11 +89,17 @@ class FakeCoordination:
             self.forget_failures -= 1
             raise CoordinationError("forget", {"resources": "retire_incomplete"})
 
+    async def release(self, participants: Any, checkpoint_id: str, kept: list, *, deadline_ts: float) -> None:
+        self.calls.append(("release", sorted(kept)))
+        if self.release_failures:
+            self.release_failures -= 1
+            raise CoordinationError("release", {"resources": "unreachable"})
+
 
 @pytest.fixture
 def coordination(monkeypatch: pytest.MonkeyPatch) -> FakeCoordination:
     fake = FakeCoordination()
-    for name in ("discover", "prepare", "commit", "restore", "resume", "retire", "forget"):
+    for name in ("discover", "prepare", "commit", "restore", "resume", "retire", "forget", "release"):
         monkeypatch.setattr(collection_module.coordination, name, getattr(fake, name))
     return fake
 
@@ -125,8 +133,9 @@ async def test_a_checkpoint_commits_the_rows_in_flight_and_publishes_them(
     published = await checkpoints.checkpoint()
 
     manifest = json.loads((published / "collection.json").read_text())
-    assert kinds(coordination) == ["prepare", "commit", "resume"]
+    assert kinds(coordination) == ["prepare", "commit", "resume", "release"]
     assert coordination.calls[1][1] == [("0-0", 0), ("1-0", 2)]
+    assert coordination.calls[3] == ("release", [published.name])
     assert (tmp_path / "LATEST").read_text() == published.name
     assert [(row["rollout_id"], row["attempt"]) for row in manifest["continued"]] == [("0-0", 0), ("1-0", 2)]
 
@@ -186,6 +195,60 @@ async def test_only_the_latest_two_checkpoints_are_kept(tmp_path: Path, coordina
     published = [await checkpoints.checkpoint() for _ in range(3)]
 
     assert [path.exists() for path in published] == [False, True, True]
+
+
+async def test_each_release_names_exactly_the_checkpoints_the_directory_still_holds(
+    tmp_path: Path, coordination: FakeCoordination
+) -> None:
+    checkpoints = started(tmp_path)
+    await checkpoints.before_dispatch("0-0", 0)
+    published = [await checkpoints.checkpoint() for _ in range(3)]
+
+    releases = [kept for kind, kept in coordination.calls if kind == "release"]
+    # The third checkpoint pruned the first, so its release no longer keeps it.
+    assert releases == [
+        [published[0].name],
+        sorted([published[0].name, published[1].name]),
+        sorted([published[1].name, published[2].name]),
+    ]
+
+
+async def test_a_failed_release_does_not_fail_the_checkpoint_and_the_next_one_catches_up(
+    tmp_path: Path, coordination: FakeCoordination
+) -> None:
+    checkpoints = started(tmp_path)
+    await checkpoints.before_dispatch("0-0", 0)
+    coordination.release_failures = 1
+    first = await checkpoints.checkpoint()
+    second = await checkpoints.checkpoint()
+
+    assert first is not None and second is not None
+    assert [kept for kind, kept in coordination.calls if kind == "release"] == [
+        [first.name],
+        sorted([first.name, second.name]),
+    ]
+
+
+async def test_a_completed_run_releases_everything_and_an_unfinished_one_releases_nothing_at_close(
+    tmp_path: Path, coordination: FakeCoordination
+) -> None:
+    unfinished = started(tmp_path / "unfinished")
+    await unfinished.close()
+    completed = started(tmp_path / "completed")
+    await completed.close(completed=True)
+
+    assert coordination.calls == [("release", [])]
+
+
+async def test_a_run_a_preemption_stopped_releases_nothing_even_if_closed_as_complete(
+    tmp_path: Path, coordination: FakeCoordination
+) -> None:
+    checkpoints = started(tmp_path)
+    await checkpoints.before_dispatch("0-0", 0)
+    await checkpoints.checkpoint(stop=True)
+    await checkpoints.close(completed=True)
+
+    assert "release" not in kinds(coordination)
 
 
 async def test_restore_continues_only_unfinished_rows_as_their_next_attempt(
@@ -507,6 +570,7 @@ async def test_a_failed_retire_is_repeated_before_the_next_checkpoint_and_at_clo
         "prepare",
         "commit",
         "resume",
+        "release",
         retire,
         "forget",
     ]

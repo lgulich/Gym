@@ -2605,14 +2605,17 @@ class RolloutCollectionHelper(BaseModel):
         )
         collection = asyncio.create_task(self._run_from_config(config, checkpointer=checkpointer))
         checkpointer.start(collection)
+        completed = False
         try:
-            return await collection
+            result = await collection
+            completed = True
+            return result
         except asyncio.CancelledError:
             if not checkpointer.stopped:
                 raise
             raise CollectionStopped(checkpointer.last_published) from None
         finally:
-            await checkpointer.close()
+            await checkpointer.close(completed=completed)
 
     async def _run_from_config(
         self, config: RolloutCollectionConfig, checkpointer: Optional[CollectionCheckpointer] = None

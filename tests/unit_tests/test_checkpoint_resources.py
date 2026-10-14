@@ -55,7 +55,7 @@ class CounterServer(SimpleResourcesServer):
     async def verify(self, body: BaseVerifyRequest) -> BaseVerifyResponse:
         return BaseVerifyResponse(**body.model_dump(), reward=1.0)
 
-    async def export_session_states(self, session_ids: list[str]) -> dict[str, JsonValue]:
+    async def export_session_states(self, session_ids: list[str], *, checkpoint_id: str) -> dict[str, JsonValue]:
         return {
             session_id: {"count": self.counters[session_id]}
             for session_id in session_ids
@@ -667,7 +667,7 @@ async def test_a_seed_that_finishes_after_its_retire_was_cut_short_registers_its
         seeded = await seed
         # An MCP tool call names only its session, with no rollout prefix.
         late = await client.post("/increment")
-        exported = await server._checkpoint.export(None)
+        exported = await server._checkpoint.export(None, checkpoint_id="c")
         refused = await client.post("/ng-control/v1/checkpoint/forget", json=forget, headers=AUTH)
         retried = await client.post("/ng-control/v1/checkpoint/retire", json=retire, headers=AUTH)
         forgotten = await client.post("/ng-control/v1/checkpoint/forget", json=forget, headers=AUTH)
@@ -1166,7 +1166,7 @@ async def test_live_sessions_outside_the_commit_scope_are_not_exported(tmp_path:
 class PlainHooks:
     """A server that implements only the required hooks: parking is optional."""
 
-    async def export_session_states(self, session_ids: list[str]) -> dict[str, JsonValue]:
+    async def export_session_states(self, session_ids: list[str], *, checkpoint_id: str) -> dict[str, JsonValue]:
         return {}
 
     async def restore_session_states(self, states: dict[str, JsonValue]) -> None:
@@ -1181,14 +1181,18 @@ async def test_a_server_without_the_park_hook_parks_nothing() -> None:
     episode = EpisodeId(rollout_id="r")
     participant.seeded("sess", episode)
     await participant.park_exported([ResourcesSessionRecord(episode_id=episode, session_id="sess", state={})])
+    await participant.release(["c1"])
 
 
 class RecordingHooks:
     def __init__(self) -> None:
         self.parked: list[list[str]] = []
+        self.released: list[list[str]] = []
+        self.exported_for: list[str] = []
 
-    async def export_session_states(self, session_ids: list[str]) -> dict[str, JsonValue]:
-        return {}
+    async def export_session_states(self, session_ids: list[str], *, checkpoint_id: str) -> dict[str, JsonValue]:
+        self.exported_for.append(checkpoint_id)
+        return {session_id: {} for session_id in session_ids}
 
     async def restore_session_states(self, states: dict[str, JsonValue]) -> None:
         pass
@@ -1198,6 +1202,9 @@ class RecordingHooks:
 
     async def park_session_states(self, session_ids: list[str]) -> None:
         self.parked.append(session_ids)
+
+    async def release_external_state(self, kept_checkpoint_ids: list[str]) -> None:
+        self.released.append(kept_checkpoint_ids)
 
 
 @pytest.mark.parametrize("mode", ["exported", "restart_only"])
@@ -1214,3 +1221,23 @@ async def test_park_exported_parks_the_exported_sessions_of_an_exported_server_o
     await participant.park_exported(records)
 
     assert hooks.parked == ([["sess"]] if mode == "exported" else [])
+
+
+@pytest.mark.parametrize("mode", ["exported", "restart_only"])
+async def test_release_reaches_the_hook_of_an_exported_server_only(mode: str) -> None:
+    hooks = RecordingHooks()
+    participant = ResourcesParticipant(hooks, mode)  # type: ignore[arg-type]
+
+    await participant.release(["c1", "c2"])
+
+    assert hooks.released == ([["c1", "c2"]] if mode == "exported" else [])
+
+
+async def test_the_export_hook_receives_the_checkpoint_being_committed() -> None:
+    hooks = RecordingHooks()
+    participant = ResourcesParticipant(hooks, "exported")  # type: ignore[arg-type]
+    participant.seeded("sess", EpisodeId(rollout_id="r"))
+
+    [record] = await participant.export(None, checkpoint_id="c9")
+
+    assert hooks.exported_for == ["c9"] and record.session_id == "sess"

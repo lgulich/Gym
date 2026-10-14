@@ -14,7 +14,10 @@ A checkpoint:
    except those some server cannot capture, such as a restart-only agent's: they keep running,
    and are recorded as restarts;
 4. writes this run's manifest, then points ``LATEST`` at the new checkpoint, which publishes it;
-5. resumes, or stops the run when the checkpoint was asked for by a preemption signal.
+5. resumes, or stops the run when the checkpoint was asked for by a preemption signal;
+6. after a resume, releases: tells the servers which checkpoints the directory still holds,
+   so they delete what the pruned ones kept outside Gym, such as sandbox snapshots.
+   A run that completes releases them all.
 
 Every run keeps a dispatch log: its run ID, then each attempt it sends,
 appended just before the ``/run`` that sends it, and each attempt a restore installs or a crashed run left fenced.
@@ -279,6 +282,8 @@ class CollectionCheckpointer:
                     # Resume also aborts a checkpoint that was not published.
                     await coordination.resume(participants, checkpoint_id, deadline_ts=time.time() + self.timeout_s)
             self._dispatching.set()
+            if published is not None:
+                await self._release(checkpoint_id, await asyncio.to_thread(self._published_ids))
             return published
 
     async def _commit(
@@ -339,6 +344,21 @@ class CollectionCheckpointer:
                 shutil.rmtree(path, ignore_errors=True)
             elif path.is_file() and path.name.startswith("."):
                 path.unlink(missing_ok=True)
+
+    def _published_ids(self) -> list[str]:
+        """Every checkpoint in the directory that a restore could read: the ones with a manifest."""
+        return sorted(path.name for path in self.checkpoint_dir.iterdir() if (path / MANIFEST).exists())
+
+    async def _release(self, checkpoint_id: str, kept: list[str]) -> None:
+        """Tell the servers which checkpoints the run may still restore. A failure is caught up by the next one."""
+        try:
+            participants = await self._discover()
+            await coordination.release(participants, checkpoint_id, kept, deadline_ts=time.time() + self.timeout_s)
+        except Exception:
+            LOGGER.warning(
+                "could not release what dropped checkpoints keep outside Gym; the next release tries again",
+                exc_info=True,
+            )
 
     async def _discover(self) -> coordination.Participants:
         if self._participants is None:
@@ -474,7 +494,13 @@ class CollectionCheckpointer:
             self._timer = asyncio.create_task(self._every())
         _atomic_write(self.checkpoint_dir / "collector.pid", str(os.getpid()).encode())
 
-    async def close(self) -> None:
+    async def close(self, *, completed: bool = False) -> None:
+        """Stop the triggers and settle retires and forgets.
+
+        ``completed`` means every row finished: nothing will be restored from this run's checkpoints,
+        so the servers delete everything they kept outside Gym for them.
+        A run stopped by a preemption signal is not complete; its rerun restores from its last checkpoint.
+        """
         loop = asyncio.get_running_loop()
         for signum in (signal.SIGUSR1, signal.SIGTERM):
             loop.remove_signal_handler(signum)
@@ -497,6 +523,8 @@ class CollectionCheckpointer:
             await self._retire_unretired()
             if self._retired:
                 LOGGER.error("could not forget %d rollouts; their refusals stay on the servers", len(self._retired))
+            if completed and not self.stopped:
+                await self._release(f"release-{uuid.uuid4().hex[:12]}", [])
 
     def _spawn(self, make: Callable[[], Any]) -> asyncio.Task:
         task = asyncio.create_task(make())
