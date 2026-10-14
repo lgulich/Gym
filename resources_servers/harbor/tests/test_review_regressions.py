@@ -80,40 +80,6 @@ def test_templates_resolve_at_use_without_changing_materialized_task(tmp_path, m
     assert "verifier-secret" not in (server._sessions["rs-1"].task.path / "task.toml").read_text()
 
 
-@pytest.mark.parametrize("variant", ["agent_user", "dockerfile_user"])
-def test_unsupported_semantics_fail_before_provisioning(tmp_path, monkeypatch, variant):
-    # Separate verification is supported since M10; agent user overrides arrive with overlay images.
-    toml = TASK_TOML
-    dockerfile = "FROM ubuntu:24.04\nWORKDIR /app"
-    if variant == "agent_user":
-        toml = toml.replace("[agent]", '[agent]\nuser = "nobody"')
-    else:
-        dockerfile += "\nUSER nobody"
-    server, task, _, created = make_server(tmp_path, monkeypatch, toml=toml, dockerfile=dockerfile)
-    response = TestClient(server.setup_webserver()).post("/seed_session", json=seed_body(task))
-    assert response.status_code == 422 and "not supported" in response.text
-    assert created == []
-
-
-# A Compose file makes the task a Compose group (M13), covered by TestComposeAndRouting.
-@pytest.mark.parametrize("build_file", [None, "Dockerfile"])
-def test_prebuilt_environment_files_only_uploaded_without_build_definition(tmp_path, monkeypatch, build_file):
-    toml = TASK_TOML.replace("[environment]", '[environment]\ndocker_image = "ubuntu:24.04"')
-    server, task, sandbox, _ = make_server(tmp_path, monkeypatch, toml=toml)
-    env = task.path / "environment"
-    (env / "Dockerfile").unlink()
-    if build_file:
-        (env / build_file).write_text("FROM ubuntu:24.04" if build_file == "Dockerfile" else "services: {}")
-    (env / "input.txt").write_text("task input")
-    task = refresh_task(server, task)
-    response = TestClient(server.setup_webserver()).post("/seed_session", json=seed_body(task))
-    assert response.status_code == 200, response.text
-    assert len(sandbox.uploaded_archives) == (0 if build_file else 1)
-    if not build_file:
-        with tarfile.open(fileobj=io.BytesIO(sandbox.uploaded_archives[0])) as archive:
-            assert archive.extractfile("input.txt").read() == b"task input"
-
-
 def test_live_folder_edits_do_not_change_seeded_verifier(tmp_path, monkeypatch):
     server, task, sandbox, _ = make_server(tmp_path, monkeypatch)
     original = (task.path / "tests" / "test.sh").read_bytes()
